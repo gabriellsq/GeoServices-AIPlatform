@@ -16,8 +16,8 @@ Unreviewed generated code teaches little. Therefore the **core RAG logic is hand
 
 ## 2. MVP definition of done
 
-1. `docker compose up` starts `api`, `postgres` (with pgvector) and `minio` locally.
-2. The Waihi and Macraes NI 43-101 technical reports are ingested: raw PDFs in MinIO; chunks, metadata and embeddings in Postgres.
+1. `docker compose up` starts `api` and `postgres` (with pgvector) locally; raw PDFs live in a local-filesystem blob store (`blobdata/`).
+2. The Waihi and Macraes NI 43-101 technical reports are ingested: raw PDFs in the local blob store; chunks, metadata and embeddings in Postgres.
 3. `POST /ask` and `geoagent ask "..."` return a grounded answer with citations (document title, page range, section).
 4. The smoke set (~30 hand-written Q&A pairs) runs via `geoagent smoke`; results are reviewed manually and recorded in `docs/learning-log.md`.
 5. `terraform apply` deploys the same container image to Cloud Run with Cloud SQL, GCS and Vertex AI; the ingest job runs in the cloud; one question is answered from the cloud endpoint; then `terraform destroy` removes everything except the state bucket.
@@ -37,7 +37,7 @@ MCP server, agents/tool-calling, Google ADK, scored eval harness, OpenTelemetry 
 | Embedding model | Gemini embeddings (`gemini-embedding-001`, 768 dims) **in every environment** | Vector dimension and vector space must be identical everywhere, otherwise a local index is useless in cloud. Model name to be re-verified as current when the plan is written. |
 | Vector store | Postgres + pgvector (no dedicated vector DB) | One system; chunk text, metadata and vectors written in one transaction (no dual-write sync problem); tenant filtering in plain SQL. Corpus size (~5–20k chunks) is far below pgvector limits. Matches Google's "RAG with Vertex AI + AlloyDB/Cloud SQL" reference architecture. |
 | Cloud database | Cloud SQL for PostgreSQL (smallest tier) | Cheapest Postgres with pgvector. AlloyDB (ScaNN, columnar engine, higher SLA) is the documented upgrade path when scale justifies it; migration is dump/restore + connection string. |
-| Blob store | MinIO locally, GCS in cloud, behind a `BlobStore` interface | Raw PDFs are the source of truth for re-parsing/re-chunking; Postgres stores pointers (`blob_uri`), never chunk text in blobs. |
+| Blob store | Local filesystem (`blobdata/`, URIs `local://<bucket>/<key>`) locally, GCS in cloud, behind a `BlobStore` interface | MinIO was the original choice, but its community edition stopped publishing images (Oct 2025) and was archived (Apr 2026); a filesystem store keeps the same interface lesson with zero extra infrastructure. Raw PDFs are the source of truth for re-parsing/re-chunking; Postgres stores pointers (`blob_uri`), never chunk text in blobs. |
 | Framework | **Plain Python** (psycopg 3, raw SQL, `google-genai`, `httpx`) — no LangChain/LlamaIndex | Every step must be visible and explainable. Google ADK is evaluated later in the agent sprint against a hand-written tool loop. |
 | Interface | FastAPI (+ auto Swagger at `/docs`) and a Typer CLI | Focus is backend/platform; a UI adds little learning value at this stage. |
 | PDF parser | PyMuPDF | Fast page-level text and basic table detection. AGPL licence is acceptable for a public portfolio repo. Docling comparison is a later learning-log experiment. |
@@ -48,7 +48,7 @@ MCP server, agents/tool-calling, Google ADK, scored eval harness, OpenTelemetry 
 
 ```
 Dev machine (repo)                          GPU host(s) on the LAN
-docker compose: api · postgres · minio ───► Ollama (generation)
+docker compose: api · postgres ─────────► Ollama (generation)
           │
           └──► Gemini API (embeddings, every environment)
 ```
@@ -61,12 +61,14 @@ docker compose: api · postgres · minio ───► Ollama (generation)
 | Variable | Local | Cloud |
 |---|---|---|
 | `LLM_PROVIDER` | `ollama` | `vertex` |
-| `LLM_MODEL` | e.g. `qwen3:14b` / `gemma3:27b` | Gemini Flash model id (verify current in plan) |
+| `LLM_MODEL` | e.g. `qwen3:14b` / `gemma3:27b` | `gemini-3.8-flash` (latest stable Flash as of 2026-10) |
 | `OLLAMA_BASE_URL` | `http://<gpu-host>:11434` | unused |
 | `GEMINI_API_KEY` | AI Studio key (in `.env`, git-ignored) | unused (Vertex uses Application Default Credentials) |
 | `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` | unused | set by Terraform |
 | `EMBEDDING_MODEL`, `EMBEDDING_DIM` | `gemini-embedding-001`, `768` | same |
-| `BLOB_STORE` | `minio` | `gcs` |
+| `EMBEDDING_BATCH_SIZE` | `32` | `32` (Vertex limit: 250 texts **and** 20k tokens per request; 32 × 512-token chunks fits) |
+| `EMBEDDING_LOCATION` | unused | region for Vertex embeddings (e.g. `us-central1`) |
+| `BLOB_STORE`, `BLOB_ROOT` | `local`, `blobdata` | `gcs`, unused |
 | `BLOB_BUCKET` | `geoagent-raw` | Terraform-created bucket name |
 | `DATABASE_URL` | compose Postgres | Cloud SQL via Unix socket `/cloudsql/PROJECT:REGION:INSTANCE` |
 
@@ -75,7 +77,7 @@ docker compose: api · postgres · minio ───► Ollama (generation)
 | Module | Responsibility | Author |
 |---|---|---|
 | `geoagent/config.py` | Typed settings | LLM-written, developer reviews |
-| `geoagent/blobstore/` | `BlobStore` protocol (`put`, `get`, `uri_for`); `MinioBlobStore`, `GcsBlobStore` | LLM-written, developer reviews |
+| `geoagent/blobstore/` | `BlobStore` protocol (`put`, `get`, `list_keys`, `uri_for`); `LocalFsBlobStore`, `GcsBlobStore` | LLM-written, developer reviews |
 | `geoagent/providers/` | `LLMProvider` protocol (`generate(prompt, ...) -> Generation`); `EmbeddingProvider` protocol (`embed(texts, task_type) -> list[vector]`); `OllamaProvider`, `VertexGeminiProvider`, `GeminiEmbeddings` | **Developer:** protocols + `OllamaProvider`. LLM: Vertex/Gemini adapters |
 | `geoagent/ingest/parse.py` | PDF → list of pages (number, text, extracted tables as text) | **Developer** |
 | `geoagent/ingest/chunker.py` | Pages → chunks: section-aware (NI 43-101 numbered headings), token-limited, page tracking, repeated header/footer removal | **Developer** |
@@ -165,8 +167,8 @@ Notes:
 ### 7.1 Ingest (identical code: CLI locally, Cloud Run Job in cloud)
 
 1. `scripts/fetch_reports.py` downloads PDFs to `data/`.
-2. `geoagent ingest --workspace nz-gold [PATHS...] [--from-blob PREFIX]` — sources are local file paths (local dev) and/or every PDF under a blob-store prefix such as `incoming/` (cloud job). For each file compute `sha256`. If `(workspace_id, sha256)` exists with status `ready`, skip.
-3. Store the canonical copy at `raw/{workspace_id}/{document_id}.pdf` (upload for local paths, server-side copy for `--from-blob` sources); insert `documents` row with status `uploaded`.
+2. `geoagent ingest --workspace nz-gold [PATHS...] [--from-blob PREFIX]` — sources are local file paths (local dev) and/or every PDF under a blob-store prefix such as `incoming/nz-gold/` (cloud job; `POST /documents` also uploads there). For each file compute `sha256`. If `(workspace_id, sha256)` exists with status `ready`, skip.
+3. Store the canonical copy at `raw/{workspace_id}/{document_id}.pdf` (the bytes are read anyway for parsing, so a plain write is used for both source types); insert `documents` row with status `uploaded`.
 4. Set `processing`; parse → chunk → embed in batches using task type `RETRIEVAL_DOCUMENT`, with exponential-backoff retries on HTTP 429/5xx; L2-normalise vectors.
 5. In **one transaction**: delete existing chunks for the document, insert new chunks, set status `ready`.
 6. On any exception: set status `failed` with the error message; continue with the next file. Re-running is safe (idempotent).
@@ -225,9 +227,9 @@ infra/terraform/
 ```
 
 - Cloud Run service: `uvicorn geoagent.api.main:app --port $PORT`, `min_instances = 0`, Cloud SQL connection via the built-in Cloud SQL integration.
-- Cloud Run job: `geoagent migrate && geoagent ingest --workspace nz-gold --from-blob incoming/`. Migrations run idempotently at the start of each job execution, so no separate migration step or DB network access from the dev machine is needed.
+- Cloud Run job: `geoagent migrate && geoagent ingest --workspace nz-gold --from-blob incoming/nz-gold/`. Migrations run idempotently at the start of each job execution, so no separate migration step or DB network access from the dev machine is needed.
 - Cloud SQL: public IP with **no authorized networks**; reachable only through the Cloud SQL connector. Private IP/VPC deferred to the security sprint.
-- Runbook `docs/deploy.md`: build/push image → `terraform apply` → upload PDFs to `gs://<bucket>/incoming/` → `gcloud run jobs execute geoagent-ingest` → `curl /ask` → `terraform destroy` (with a checklist confirming nothing billable remains).
+- Runbook `docs/deploy.md`: build/push image → `terraform apply` → upload PDFs to `gs://<bucket>/incoming/nz-gold/` → `gcloud run jobs execute geoagent-ingest` → `curl /ask` → `terraform destroy` (with a checklist confirming nothing billable remains).
 
 ## 12. Roadmap after Sprint 1 (each gets its own spec)
 
