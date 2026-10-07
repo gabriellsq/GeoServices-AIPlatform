@@ -21,6 +21,7 @@
 - Run all commands from the repo root.
 - Unit tests: `uv run pytest -m "not integration"`. Integration tests need Postgres: `docker compose up -d postgres` first, then `uv run pytest -m integration`.
 - Database connections are opened with `autocommit=True`; atomic units of work use `with conn.transaction():`.
+- Local Postgres is always addressed as `127.0.0.1` (never `localhost`: on Windows, WSL's `wslrelay` can hold `[::1]:5432` and black-hole IPv6 connections) with a `connect_timeout`, so a stopped container fails fast.
 - Everything is **synchronous** (sync psycopg, sync httpx, sync FastAPI endpoints run in the threadpool). Async is a later-sprint topic.
 - Commits: conventional-commit subject, no AI attribution trailer. Before each commit, check staged files contain no personal information.
 
@@ -161,7 +162,7 @@ Create each `__init__.py` listed under **Files** as an empty file.
 
 ```dotenv
 # Copy to .env and fill in. .env is git-ignored.
-DATABASE_URL=postgresql://<DB_USER>:<DB_PASSWORD>@localhost:5432/geoagent
+DATABASE_URL=postgresql://<DB_USER>:<DB_PASSWORD>@127.0.0.1:5432/geoagent?connect_timeout=10
 
 BLOB_STORE=local
 BLOB_ROOT=blobdata
@@ -289,11 +290,11 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
       POSTGRES_DB: geoagent
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -314,7 +315,7 @@ pytestmark = pytest.mark.integration
 
 
 def test_pgvector_extension_is_available():
-    with psycopg.connect("postgresql://<DB_USER>:<DB_PASSWORD>@localhost:5432/geoagent") as conn:
+    with psycopg.connect("postgresql://<DB_USER>:<DB_PASSWORD>@127.0.0.1:5432/geoagent?connect_timeout=5") as conn:
         row = conn.execute(
             "SELECT default_version FROM pg_available_extensions WHERE name = 'vector'"
         ).fetchone()
@@ -397,7 +398,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    database_url: str = "postgresql://<DB_USER>:<DB_PASSWORD>@localhost:5432/geoagent"
+    database_url: str = "postgresql://<DB_USER>:<DB_PASSWORD>@127.0.0.1:5432/geoagent?connect_timeout=10"
 
     blob_store: Literal["local", "gcs"] = "local"
     blob_root: Path = Path("blobdata")
@@ -513,7 +514,8 @@ from geoagent.db.connection import connect
 from geoagent.db.migrate import apply_migrations
 
 TEST_DATABASE_URL = os.environ.get(
-    "TEST_DATABASE_URL", "postgresql://<DB_USER>:<DB_PASSWORD>@localhost:5432/geoagent_test"
+    "TEST_DATABASE_URL",
+    "postgresql://<DB_USER>:<DB_PASSWORD>@127.0.0.1:5432/geoagent_test?connect_timeout=5",
 )
 
 
@@ -3196,11 +3198,11 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
       POSTGRES_DB: geoagent
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 20
