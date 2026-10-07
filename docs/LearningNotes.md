@@ -216,3 +216,16 @@ User ─► Identity Platform / IAP (token: tenant_id, user_id, roles)
 - `connect_timeout` turned a 261 s hang into a 5 s failure. Root cause was environmental: on Windows, WSL's `wslrelay` holds `[::1]:5432`, so `localhost` → IPv6 → black hole. Use `127.0.0.1`.
 - Dev Postgres binds to `127.0.0.1` only — never expose a dev database to the LAN.
 - Healthchecks should test what clients use (TCP `-h 127.0.0.1`), not a side channel (unix socket during init).
+
+---
+
+## 6. Schema migrations
+
+- **Concurrent runners race.** Two deploys/jobs running migrations at once → `CREATE TABLE IF NOT EXISTS` / `CREATE EXTENSION` collide (reproduced: 4 runners → 3 crashed).
+  Fix: take `pg_advisory_xact_lock(<constant>)` **before** touching `schema_migrations`, then re-read what is applied under the lock. Waiters block, then see "nothing to do".
+- **All-or-nothing:** run every pending file in one transaction — Postgres DDL is transactional, so a failure in file N rolls back files 1..N-1 and the bookkeeping rows.
+- Prefer the **transaction-scoped** lock (`_xact_`): released automatically on commit/rollback; a session lock on an autocommit connection leaks if you forget to unlock.
+- Exceptions to "everything in a transaction": `CREATE INDEX CONCURRENTLY`, some `ALTER TYPE ... ADD VALUE` — they need their own non-transactional step.
+- Read SQL files as `utf-8-sig` (Windows editors add a BOM → `syntax error at or near "\ufeff"`).
+- Pin extension images (`pgvector/pgvector:0.8.7-pg16`, not `:pg16`) so behaviour you rely on (iterative index scans need ≥ 0.8) cannot silently change.
+- Test databases: refuse to run destructive test setup (`DROP DATABASE`) unless the host is local.
