@@ -91,6 +91,8 @@ GeoSolution/
 
 ## Task 1: Project scaffold [LLM zone]
 
+> **Status: done.** Implemented with review amendments; the committed files are the source of truth where they differ from the text below (credentials moved to `.env` as split `DB_*` fields, `127.0.0.1` everywhere, `SecretStr`, timeout budget, settings hardening).
+
 **Files:**
 - Create: `pyproject.toml`, `.env.example`, `.dockerignore`, `README.md`, `docs/learning-log.md`
 - Create: `geoagent/__init__.py`, `geoagent/db/__init__.py`, `geoagent/blobstore/__init__.py`, `geoagent/providers/__init__.py`, `geoagent/ingest/__init__.py`, `geoagent/rag/__init__.py`, `geoagent/api/__init__.py`
@@ -162,7 +164,11 @@ Create each `__init__.py` listed under **Files** as an empty file.
 
 ```dotenv
 # Copy to .env and fill in. .env is git-ignored.
-DATABASE_URL=postgresql://<DB_USER>:<DB_PASSWORD>@127.0.0.1:5432/geoagent?connect_timeout=10
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_NAME=geoagent
+DB_USER=
+DB_PASSWORD=
 
 BLOB_STORE=local
 BLOB_ROOT=blobdata
@@ -275,6 +281,8 @@ git commit -m "chore: scaffold geoagent package, tooling and learning log"
 
 ## Task 2: Docker Compose Postgres + pgvector [LLM zone]
 
+> **Status: done.** Implemented with review amendments; the committed files are the source of truth where they differ from the text below (credentials moved to `.env` as split `DB_*` fields, `127.0.0.1` everywhere, `SecretStr`, timeout budget, settings hardening).
+
 **Files:**
 - Create: `docker-compose.yml`
 - Create: `tests/integration/test_postgres_available.py`
@@ -288,7 +296,7 @@ services:
     environment:
       POSTGRES_USER: ${DB_USER:?set DB_USER in .env}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
-      POSTGRES_DB: geoagent
+      POSTGRES_DB: ${DB_NAME:-geoagent}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -315,7 +323,7 @@ pytestmark = pytest.mark.integration
 
 
 def test_pgvector_extension_is_available():
-    with psycopg.connect("postgresql://<DB_USER>:<DB_PASSWORD>@127.0.0.1:5432/geoagent?connect_timeout=5") as conn:
+    with psycopg.connect(Settings().conninfo()) as conn:
         row = conn.execute(
             "SELECT default_version FROM pg_available_extensions WHERE name = 'vector'"
         ).fetchone()
@@ -345,6 +353,8 @@ git commit -m "chore: add postgres+pgvector compose service"
 ---
 
 ## Task 3: Settings [LLM zone]
+
+> **Status: done.** Implemented with review amendments; the committed files are the source of truth where they differ from the text below (credentials moved to `.env` as split `DB_*` fields, `127.0.0.1` everywhere, `SecretStr`, timeout budget, settings hardening).
 
 **Files:**
 - Create: `geoagent/config.py`
@@ -398,7 +408,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    database_url: str = "postgresql://<DB_USER>:<DB_PASSWORD>@127.0.0.1:5432/geoagent?connect_timeout=10"
+    # see committed geoagent/config.py: split DB_* fields, db_password: SecretStr (required)
 
     blob_store: Literal["local", "gcs"] = "local"
     blob_root: Path = Path("blobdata")
@@ -407,7 +417,7 @@ class Settings(BaseSettings):
     llm_provider: Literal["ollama", "vertex"] = "ollama"
     llm_model: str = "qwen3:14b"
     llm_timeout_s: float = 60.0
-    ollama_base_url: str = "http://localhost:11434"
+    ollama_base_url: str = "http://127.0.0.1:11434"
 
     gemini_api_key: str | None = None
     google_cloud_project: str | None = None
@@ -444,27 +454,153 @@ git commit -m "feat: add typed settings"
 ## Task 4: Schema migration [SQL: Developer zone; runner + tests: LLM zone]
 
 **Files:**
-- Create (LLM): `geoagent/db/connection.py`, `geoagent/db/migrate.py`, `tests/integration/conftest.py`, `tests/integration/test_migrations.py`
+- Create (LLM): `geoagent/db/connection.py`, `geoagent/db/migrate.py`, `tests/unit/test_db_connection.py`, `tests/integration/conftest.py`, `tests/integration/test_migrations.py`
 - Create (DEV): `geoagent/db/migrations/001_init.sql`
 
 **Contract for `001_init.sql` (developer writes it):** the schema in spec §6, exactly: extension `vector`; tables `workspaces`, `documents`, `chunks` with the listed columns, `CHECK` on `documents.status`, `UNIQUE (workspace_id, sha256)` on documents, `UNIQUE (document_id, ordinal)` on chunks, `ON DELETE CASCADE` from chunks to documents, an HNSW index named `chunks_embedding_hnsw` using `vector_cosine_ops`, and a btree index `chunks_workspace` on `chunks(workspace_id)`.
 
-- [ ] **Step 1 [LLM]: Implement `geoagent/db/connection.py`**
+- [ ] **Step 1a [LLM]: Write the failing connection tests**
+
+`tests/unit/test_db_connection.py`:
 
 ```python
+import logging
+
+import psycopg
+import pytest
+from psycopg.conninfo import conninfo_to_dict
+
+from geoagent.config import Settings
+from geoagent.db import connection
+
+PASSWORD = "hunter2-not-real"
+
+
+def settings(**overrides) -> Settings:
+    return Settings(_env_file=None, db_user="app", db_password=PASSWORD, **overrides)
+
+
+def test_retries_with_backoff_then_succeeds(monkeypatch):
+    calls, sleeps, sentinel = [], [], object()
+
+    def fake_connect(conninfo, autocommit):
+        calls.append(conninfo)
+        if len(calls) < 3:
+            raise psycopg.OperationalError("connection refused")
+        return sentinel
+
+    monkeypatch.setattr(connection.psycopg, "connect", fake_connect)
+    conn = connection.connect(
+        settings(db_connect_retries=3), register_vector_type=False, sleep=sleeps.append
+    )
+    assert conn is sentinel
+    assert len(calls) == 3
+    assert len(sleeps) == 2
+    assert 0.5 <= sleeps[0] < 0.75 and 1.0 <= sleeps[1] < 1.25
+
+
+def test_gives_up_after_configured_attempts(monkeypatch):
+    attempts = []
+
+    def fake_connect(conninfo, autocommit):
+        attempts.append(1)
+        raise psycopg.OperationalError("down")
+
+    monkeypatch.setattr(connection.psycopg, "connect", fake_connect)
+    with pytest.raises(psycopg.OperationalError):
+        connection.connect(
+            settings(db_connect_retries=2), register_vector_type=False, sleep=lambda s: None
+        )
+    assert len(attempts) == 2
+
+
+def test_passes_dbname_statement_timeout_and_autocommit(monkeypatch):
+    seen = {}
+
+    def fake_connect(conninfo, autocommit):
+        seen.update(conninfo=conninfo, autocommit=autocommit)
+        return object()
+
+    monkeypatch.setattr(connection.psycopg, "connect", fake_connect)
+    connection.connect(
+        settings(), dbname="other", statement_timeout_ms=120000, register_vector_type=False
+    )
+    params = conninfo_to_dict(seen["conninfo"])
+    assert params["dbname"] == "other"
+    assert params["options"] == "-c statement_timeout=120000"
+    assert seen["autocommit"] is True
+
+
+def test_retry_logs_never_contain_the_password(monkeypatch, caplog):
+    def fake_connect(conninfo, autocommit):
+        raise psycopg.OperationalError("connection refused")
+
+    monkeypatch.setattr(connection.psycopg, "connect", fake_connect)
+    with caplog.at_level(logging.DEBUG), pytest.raises(psycopg.OperationalError):
+        connection.connect(settings(), register_vector_type=False, sleep=lambda s: None)
+    assert caplog.records, "retries should be logged"
+    assert PASSWORD not in caplog.text
+```
+
+Run: `uv run pytest tests/unit/test_db_connection.py -q`
+Expected: FAIL with `ModuleNotFoundError: No module named 'geoagent.db.connection'`.
+
+- [ ] **Step 1b [LLM]: Implement `geoagent/db/connection.py`**
+
+```python
+import logging
+import random
+import time
+from collections.abc import Callable
+
 import psycopg
 from pgvector.psycopg import register_vector
 
+from geoagent.config import Settings
 
-def connect(database_url: str) -> psycopg.Connection:
-    """Open an autocommit connection with the pgvector type adapter registered.
+log = logging.getLogger(__name__)
 
-    The `vector` extension must already exist (run migrations first).
+
+def connect(
+    settings: Settings,
+    *,
+    dbname: str | None = None,
+    statement_timeout_ms: int | None = None,
+    register_vector_type: bool = True,
+    sleep: Callable[[float], None] = time.sleep,
+) -> psycopg.Connection:
+    """Open an autocommit connection, retrying transient failures with jittered backoff.
+
+    `settings.db_connect_retries` is the total number of attempts. The conninfo string
+    contains the password, so it is never logged. Set `register_vector_type=False` when the
+    `vector` extension may not exist yet (migrations, admin connections).
     """
-    conn = psycopg.connect(database_url, autocommit=True)
-    register_vector(conn)
+    conninfo = settings.conninfo(dbname=dbname, statement_timeout_ms=statement_timeout_ms)
+    attempts = settings.db_connect_retries
+    for attempt in range(1, attempts + 1):
+        try:
+            conn = psycopg.connect(conninfo, autocommit=True)
+            break
+        except psycopg.OperationalError as exc:
+            if attempt == attempts:
+                raise
+            delay = 0.5 * 2 ** (attempt - 1) + random.uniform(0, 0.25)
+            log.warning(
+                "database connection failed, retrying",
+                extra={
+                    "attempt": attempt,
+                    "retry_in_s": round(delay, 2),
+                    "error": type(exc).__name__,
+                },
+            )
+            sleep(delay)
+    if register_vector_type:
+        register_vector(conn)
     return conn
 ```
+
+Run: `uv run pytest tests/unit/test_db_connection.py -q`
+Expected: `4 passed`.
 
 - [ ] **Step 2 [LLM]: Implement `geoagent/db/migrate.py`**
 
@@ -502,26 +638,19 @@ def apply_migrations(conn: psycopg.Connection, migrations_dir: Path = MIGRATIONS
 - [ ] **Step 3 [LLM]: Create `tests/integration/conftest.py`** (shared by all integration tests)
 
 ```python
-import os
 from collections.abc import Iterator
 
 import psycopg
 import pytest
 from psycopg import sql
-from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
+from geoagent.config import Settings
 from geoagent.db.connection import connect
 from geoagent.db.migrate import apply_migrations
 
-TEST_DATABASE_URL = os.environ.get(
-    "TEST_DATABASE_URL",
-    "postgresql://<DB_USER>:<DB_PASSWORD>@127.0.0.1:5432/geoagent_test?connect_timeout=5",
-)
 
-
-def recreate_database(url: str) -> None:
-    name = conninfo_to_dict(url)["dbname"]
-    with psycopg.connect(make_conninfo(url, dbname="postgres"), autocommit=True) as admin:
+def recreate_database(settings: Settings, name: str) -> None:
+    with connect(settings, dbname="postgres", register_vector_type=False) as admin:
         admin.execute(
             sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name))
         )
@@ -529,16 +658,23 @@ def recreate_database(url: str) -> None:
 
 
 @pytest.fixture(scope="session")
-def test_database_url() -> str:
-    recreate_database(TEST_DATABASE_URL)
-    with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as conn:
-        apply_migrations(conn)
-    return TEST_DATABASE_URL
+def settings() -> Settings:
+    """Credentials come from the repo `.env` (the same file docker compose reads)."""
+    return Settings()
+
+
+@pytest.fixture(scope="session")
+def test_db(settings: Settings) -> str:
+    name = f"{settings.db_name}_test"
+    recreate_database(settings, name)
+    with connect(settings, dbname=name, register_vector_type=False) as c:
+        apply_migrations(c)
+    return name
 
 
 @pytest.fixture
-def conn(test_database_url: str) -> Iterator[psycopg.Connection]:
-    c = connect(test_database_url)
+def conn(settings: Settings, test_db: str) -> Iterator[psycopg.Connection]:
+    c = connect(settings, dbname=test_db)
     c.execute("TRUNCATE chunks, documents, workspaces CASCADE")
     yield c
     c.close()
@@ -553,20 +689,20 @@ import uuid
 
 import psycopg
 import pytest
-from psycopg.conninfo import make_conninfo
 
+from geoagent.db.connection import connect
 from geoagent.db.migrate import apply_migrations
-from tests.integration.conftest import TEST_DATABASE_URL, recreate_database
+from tests.integration.conftest import recreate_database
 
 pytestmark = pytest.mark.integration
 
-MIGRATION_DB_URL = make_conninfo(TEST_DATABASE_URL, dbname="geoagent_migration_test")
+MIGRATION_DB = "geoagent_migration_test"
 
 
 @pytest.fixture
-def fresh() -> psycopg.Connection:
-    recreate_database(MIGRATION_DB_URL)
-    with psycopg.connect(MIGRATION_DB_URL, autocommit=True) as c:
+def fresh(settings) -> psycopg.Connection:
+    recreate_database(settings, MIGRATION_DB)
+    with connect(settings, dbname=MIGRATION_DB, register_vector_type=False) as c:
         yield c
 
 
@@ -2378,6 +2514,7 @@ def test_json_formatter_includes_request_id_and_extras():
 `tests/unit/test_api.py`:
 
 ```python
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
@@ -2447,6 +2584,18 @@ def test_ask_error_mapping(client, monkeypatch, exc, status, code):
     assert resp.status_code == status
     body = resp.json()
     assert body["error"] == code and body["request_id"]
+
+
+def test_database_unavailable_returns_503_with_retry_after(client):
+    def database_down():
+        raise psycopg.OperationalError("connection to server at 10.0.0.5 failed")
+
+    client.app.dependency_overrides[main.get_conn] = database_down
+    resp = client.post("/ask", json={"workspace_id": "ws", "question": "Grade?"})
+    assert resp.status_code == 503
+    assert resp.headers["retry-after"] == "10"
+    assert resp.json()["error"] == "database_unavailable"
+    assert "10.0.0.5" not in resp.text
 
 
 def test_ask_validation_error(client):
@@ -2579,15 +2728,15 @@ from geoagent.providers.ollama import OllamaProvider
 from geoagent.providers.types import EmbeddingProvider, LLMProvider
 
 
-def open_connection() -> psycopg.Connection:
-    return connect(get_settings().database_url)
+def open_connection(*, statement_timeout_ms: int | None = None) -> psycopg.Connection:
+    return connect(get_settings(), statement_timeout_ms=statement_timeout_ms)
 
 
 @lru_cache
 def get_embedder() -> EmbeddingProvider:
     s = get_settings()
-    if s.gemini_api_key:
-        client = genai.Client(api_key=s.gemini_api_key)
+    if s.gemini_api_key is not None:
+        client = genai.Client(api_key=s.gemini_api_key.get_secret_value())
     else:
         client = genai.Client(
             vertexai=True, project=s.google_cloud_project, location=s.embedding_location
@@ -2743,6 +2892,20 @@ def create_app() -> FastAPI:
     async def on_provider_error(request: Request, exc: ProviderError):
         return _error(502, "provider_error", exc)
 
+    @app.exception_handler(psycopg.OperationalError)
+    async def on_database_unavailable(request: Request, exc: psycopg.OperationalError):
+        # Generic detail on purpose: driver messages reveal internal hosts and ports.
+        log.warning("database unavailable", extra={"error": type(exc).__name__})
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "10"},
+            content={
+                "error": "database_unavailable",
+                "detail": "database temporarily unavailable",
+                "request_id": request_id_var.get(),
+            },
+        )
+
     @app.get("/healthz")
     def healthz() -> dict:
         return {"status": "ok"}
@@ -2812,7 +2975,7 @@ app = create_app()
 - [ ] **Step 7: Run to verify pass**
 
 Run: `uv run pytest tests/unit/test_logs.py tests/unit/test_api.py -q`
-Expected: `10 passed`.
+Expected: `11 passed`.
 
 Run: `uv run pytest tests/integration/test_api_ask.py -q`
 Expected: `1 passed`.
@@ -2931,11 +3094,11 @@ def load_smoke(path: Path) -> list[SmokeItem]:
 from pathlib import Path
 from typing import Annotated
 
-import psycopg
 import typer
 
 from geoagent import wiring
 from geoagent.config import get_settings
+from geoagent.db.connection import connect
 from geoagent.db.migrate import apply_migrations
 from geoagent.ingest.pipeline import IngestResult, ingest_bytes, ingest_from_blob
 from geoagent.logs import configure_logging
@@ -2943,6 +3106,9 @@ from geoagent.rag.answer import AskResponse, answer_question
 from geoagent.smoke import load_smoke
 
 app = typer.Typer(help="GeoAgent command-line interface", no_args_is_help=True)
+
+# Batch work (migrations, bulk inserts) gets a longer statement timeout than API requests.
+BATCH_STATEMENT_TIMEOUT_MS = 120_000
 
 
 @app.callback()
@@ -2953,7 +3119,9 @@ def main() -> None:
 @app.command()
 def migrate() -> None:
     """Apply pending SQL migrations."""
-    with psycopg.connect(get_settings().database_url, autocommit=True) as conn:
+    with connect(
+        get_settings(), statement_timeout_ms=BATCH_STATEMENT_TIMEOUT_MS, register_vector_type=False
+    ) as conn:
         applied = apply_migrations(conn)
     typer.echo(f"applied: {', '.join(applied) if applied else 'nothing (up to date)'}")
 
@@ -2977,7 +3145,7 @@ def ingest(
         raise typer.BadParameter("give PDF paths and/or --from-blob PREFIX")
     blobs, embedder = wiring.get_blobstore(), wiring.get_embedder()
     results: list[IngestResult] = []
-    with wiring.open_connection() as conn:
+    with wiring.open_connection(statement_timeout_ms=BATCH_STATEMENT_TIMEOUT_MS) as conn:
         for path in paths or []:
             results.append(
                 ingest_bytes(conn, blobs, embedder, workspace_id=workspace,
@@ -3120,6 +3288,19 @@ Ollama runs **outside** Docker Compose, on any GPU machine on the LAN. The API r
 `OLLAMA_BASE_URL`. Ollama has **no authentication** — keep port 11434 on the LAN only, never
 expose it to the internet.
 
+## Windows + NVIDIA GPU (the MVP host)
+
+Install Ollama for Windows (https://ollama.com/download), then:
+
+```bash
+ollama pull qwen3:8b
+curl http://127.0.0.1:11434/api/tags
+```
+
+The compose `api` container reaches it at `http://host.docker.internal:11434`. If that request
+fails, Ollama is listening on loopback only: set the user environment variable
+`OLLAMA_HOST=0.0.0.0`, restart Ollama, and allow port 11434 on private networks only.
+
 ## Linux + AMD GPU (ROCm, RDNA4 needs the ROCm 7 driver)
 
 Podman (works on immutable/atomic distros without layering packages):
@@ -3196,7 +3377,7 @@ services:
     environment:
       POSTGRES_USER: ${DB_USER:?set DB_USER in .env}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
-      POSTGRES_DB: geoagent
+      POSTGRES_DB: ${DB_NAME:-geoagent}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -3211,8 +3392,9 @@ services:
     build: .
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://<DB_USER>:<DB_PASSWORD>@postgres:5432/geoagent
+      DB_HOST: postgres
       BLOB_ROOT: /app/blobdata
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
     volumes:
       - ./blobdata:/app/blobdata
     ports:
@@ -3227,9 +3409,9 @@ volumes:
 
 - [ ] **Step 4: Build and run**
 
-Prerequisite: `.env` created from `.env.example` with `GEMINI_API_KEY`, `OLLAMA_BASE_URL` and `LLM_MODEL` filled in; the GPU host answers the `curl` check from `docs/local-llm.md`.
+Prerequisite: `.env` has `DB_USER`, `DB_PASSWORD` and `GEMINI_API_KEY` filled in; Ollama answers the `curl` check from `docs/local-llm.md`.
 
-Run: `docker compose up -d --build` then `curl http://localhost:8080/healthz`
+Run: `docker compose up -d --build` then `curl http://127.0.0.1:8080/healthz`
 Expected: `{"status":"ok"}`.
 
 Run: `uv run geoagent migrate`
@@ -3253,9 +3435,9 @@ git commit -m "build: add Dockerfile, compose api service and local LLM host gui
 - [ ] **Step 1: Ingest the real reports**
 
 Run: `uv run geoagent ingest --workspace nz-gold data/waihi-ni43-101.pdf data/macraes-ni43-101.pdf`
-Expected: two `ready` lines. Then `curl "http://localhost:8080/documents?workspace_id=nz-gold"` lists both with `page_count`.
+Expected: two `ready` lines. Then `curl "http://127.0.0.1:8080/documents?workspace_id=nz-gold"` lists both with `page_count`.
 
-Inspect: `docker compose exec postgres psql -U "$POSTGRES_USER" -c "SELECT d.title, count(*), avg(c.token_count)::int FROM chunks c JOIN documents d ON d.id = c.document_id GROUP BY 1"`.
+Inspect: `docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' -c "SELECT d.title, count(*), avg(c.token_count)::int FROM chunks c JOIN documents d ON d.id = c.document_id GROUP BY 1"`.
 
 - [ ] **Step 2: Ask a first question**
 
@@ -3292,6 +3474,8 @@ git commit -m "eval: add smoke set and first learning-log experiments"
 ---
 
 ## Task 20: Cross-environment embedding check [LLM zone]
+
+> **Status: superseded (2026-10-07).** The MVP no longer deploys to GCP. These tasks will be replaced by a cloud design document, local Terraform (Docker provider), and GCP Terraform that is validated but never applied. Kept for reference only; do not execute.
 
 Verifies the spec's core assumption: AI Studio and Vertex AI return the same vectors for `gemini-embedding-001`, so one index serves both.
 
@@ -3350,6 +3534,8 @@ git commit -m "chore: add AI Studio vs Vertex embedding comparison script"
 
 ## Task 21: Terraform bootstrap (state bucket) [Developer zone]
 
+> **Status: superseded (2026-10-07).** The MVP no longer deploys to GCP. These tasks will be replaced by a cloud design document, local Terraform (Docker provider), and GCP Terraform that is validated but never applied. Kept for reference only; do not execute.
+
 **Files:**
 - Create (DEV): `infra/terraform/bootstrap/main.tf`
 
@@ -3388,6 +3574,8 @@ git commit -m "infra: add terraform state bucket bootstrap"
 ---
 
 ## Task 22: Terraform main stack [scaffold: LLM zone; resources: Developer zone]
+
+> **Status: superseded (2026-10-07).** The MVP no longer deploys to GCP. These tasks will be replaced by a cloud design document, local Terraform (Docker provider), and GCP Terraform that is validated but never applied. Kept for reference only; do not execute.
 
 **Files:**
 - Create (LLM): `infra/terraform/main/versions.tf`, `variables.tf`, `locals.tf`, `outputs.tf`
@@ -3544,6 +3732,8 @@ git commit -m "infra: add main GCP stack (Cloud Run, Cloud SQL, GCS, Secret Mana
 ---
 
 ## Task 23: Deploy runbook, cloud run-through, destroy [runbook: LLM zone; execution: Developer]
+
+> **Status: superseded (2026-10-07).** The MVP no longer deploys to GCP. These tasks will be replaced by a cloud design document, local Terraform (Docker provider), and GCP Terraform that is validated but never applied. Kept for reference only; do not execute.
 
 **Files:**
 - Create: `docs/deploy.md`
