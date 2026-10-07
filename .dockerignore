@@ -8,3 +8,6 @@ infra
 evals
 **/__pycache__
 .env
+.env.*
+.pytest_cache
+.ruff_cache
