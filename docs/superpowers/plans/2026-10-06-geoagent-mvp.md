@@ -454,10 +454,60 @@ git commit -m "feat: add typed settings"
 ## Task 4: Schema migration [SQL: Developer zone; runner + tests: LLM zone]
 
 **Files:**
-- Create (LLM): `geoagent/db/connection.py`, `geoagent/db/migrate.py`, `tests/unit/test_db_connection.py`, `tests/integration/conftest.py`, `tests/integration/test_migrations.py`
-- Create (DEV): `geoagent/db/migrations/001_init.sql`
+- Create (LLM): `geoagent/db/connection.py`, `geoagent/db/migrate.py`, `geoagent/db/workspaces.py`, `tests/unit/test_db_connection.py`, `tests/integration/conftest.py`, `tests/integration/test_migrations.py`, `tests/integration/test_workspaces.py`
+- Create: `geoagent/db/migrations/001_init.sql` (developer chose subagent mode for this task)
 
-**Contract for `001_init.sql` (developer writes it):** the schema in spec §6, exactly: extension `vector`; tables `workspaces`, `documents`, `chunks` with the listed columns, `CHECK` on `documents.status`, `UNIQUE (workspace_id, sha256)` on documents, `UNIQUE (document_id, ordinal)` on chunks, `ON DELETE CASCADE` from chunks to documents, an HNSW index named `chunks_embedding_hnsw` using `vector_cosine_ops`, and a btree index `chunks_workspace` on `chunks(workspace_id)`.
+**Contract for `001_init.sql`:** exactly the schema below (also spec §6, schema v2: UUID workspace key + slug, composite tenant foreign key).
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Tenant. UUID primary key (meaningless, immutable); slug is the human-readable handle.
+CREATE TABLE workspaces (
+    id         UUID PRIMARY KEY,
+    slug       TEXT NOT NULL UNIQUE CHECK (slug ~ '^[a-z0-9][a-z0-9-]{1,62}$'),
+    name       TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per source PDF. No ON DELETE on the workspace FK: tenant offboarding is explicit.
+CREATE TABLE documents (
+    id           UUID PRIMARY KEY,
+    workspace_id UUID NOT NULL REFERENCES workspaces(id),
+    title        TEXT NOT NULL,
+    source_url   TEXT,
+    blob_uri     TEXT NOT NULL,
+    sha256       TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('uploaded','processing','ready','failed')),
+    error        TEXT,
+    page_count   INT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, sha256),
+    UNIQUE (id, workspace_id)            -- target of the composite FK below
+);
+
+-- One row per chunk. workspace_id is denormalised for filtering; the composite FK
+-- guarantees it always equals the parent document's workspace.
+CREATE TABLE chunks (
+    id           UUID PRIMARY KEY,
+    document_id  UUID NOT NULL,
+    workspace_id UUID NOT NULL,
+    ordinal      INT  NOT NULL,
+    page_start   INT  NOT NULL,
+    page_end     INT  NOT NULL,
+    section      TEXT,
+    text         TEXT NOT NULL,
+    token_count  INT  NOT NULL,
+    embedding    vector(768) NOT NULL,
+    UNIQUE (document_id, ordinal),
+    FOREIGN KEY (document_id, workspace_id)
+        REFERENCES documents (id, workspace_id) ON DELETE CASCADE
+);
+
+CREATE INDEX chunks_embedding_hnsw ON chunks USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX chunks_workspace ON chunks (workspace_id);
+```
 
 - [ ] **Step 1a [LLM]: Write the failing connection tests**
 
@@ -729,46 +779,87 @@ def test_hnsw_cosine_index_exists(fresh):
     assert "hnsw" in row[0] and "vector_cosine_ops" in row[0]
 
 
+def make_workspace(conn, slug: str = "ws") -> uuid.UUID:
+    workspace_id = uuid.uuid4()
+    conn.execute(
+        "INSERT INTO workspaces (id, slug, name) VALUES (%s, %s, %s)",
+        (workspace_id, slug, slug.upper()),
+    )
+    return workspace_id
+
+
+def make_document(conn, workspace_id, *, sha: str = "h", status: str = "ready") -> uuid.UUID:
+    document_id = uuid.uuid4()
+    conn.execute(
+        "INSERT INTO documents (id, workspace_id, title, blob_uri, sha256, status) "
+        "VALUES (%s, %s, 't', 'local://b/k', %s, %s)",
+        (document_id, workspace_id, sha, status),
+    )
+    return document_id
+
+
+def make_chunk(conn, document_id, workspace_id) -> None:
+    conn.execute(
+        "INSERT INTO chunks (id, document_id, workspace_id, ordinal, page_start, page_end, "
+        "text, token_count, embedding) "
+        "VALUES (%s, %s, %s, 0, 1, 1, 'x', 1, array_fill(0.1, ARRAY[768])::vector)",
+        (uuid.uuid4(), document_id, workspace_id),
+    )
+
+
 def test_status_check_constraint(fresh):
     apply_migrations(fresh)
-    fresh.execute("INSERT INTO workspaces (id, name) VALUES ('ws', 'WS')")
+    ws = make_workspace(fresh)
     with pytest.raises(psycopg.errors.CheckViolation):
-        fresh.execute(
-            "INSERT INTO documents (id, workspace_id, title, blob_uri, sha256, status) "
-            "VALUES (%s, 'ws', 't', 'local://b/k', 'abc', 'bogus')",
-            (uuid.uuid4(),),
-        )
+        make_document(fresh, ws, status="bogus")
 
 
-def test_sha256_unique_per_workspace(fresh):
+def test_sha256_unique_per_workspace_only(fresh):
     apply_migrations(fresh)
-    fresh.execute("INSERT INTO workspaces (id, name) VALUES ('ws', 'WS')")
-    insert = (
-        "INSERT INTO documents (id, workspace_id, title, blob_uri, sha256, status) "
-        "VALUES (%s, 'ws', 't', 'local://b/k', 'same', 'uploaded')"
-    )
-    fresh.execute(insert, (uuid.uuid4(),))
+    ws_a, ws_b = make_workspace(fresh, "ws-a"), make_workspace(fresh, "ws-b")
+    make_document(fresh, ws_a, sha="same")
+    make_document(fresh, ws_b, sha="same")  # same PDF in another tenant is allowed
     with pytest.raises(psycopg.errors.UniqueViolation):
-        fresh.execute(insert, (uuid.uuid4(),))
+        make_document(fresh, ws_a, sha="same")
 
 
 def test_deleting_document_cascades_to_chunks(fresh):
     apply_migrations(fresh)
-    doc_id = uuid.uuid4()
-    fresh.execute("INSERT INTO workspaces (id, name) VALUES ('ws', 'WS')")
-    fresh.execute(
-        "INSERT INTO documents (id, workspace_id, title, blob_uri, sha256, status) "
-        "VALUES (%s, 'ws', 't', 'local://b/k', 'h', 'ready')",
-        (doc_id,),
-    )
-    fresh.execute(
-        "INSERT INTO chunks (id, document_id, workspace_id, ordinal, page_start, page_end, "
-        "text, token_count, embedding) "
-        "VALUES (%s, %s, 'ws', 0, 1, 1, 'x', 1, array_fill(0.1, ARRAY[768])::vector)",
-        (uuid.uuid4(), doc_id),
-    )
-    fresh.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
+    ws = make_workspace(fresh)
+    doc = make_document(fresh, ws)
+    make_chunk(fresh, doc, ws)
+    fresh.execute("DELETE FROM documents WHERE id = %s", (doc,))
     assert fresh.execute("SELECT count(*) FROM chunks").fetchone() == (0,)
+
+
+def test_chunk_cannot_belong_to_another_tenant_than_its_document(fresh):
+    apply_migrations(fresh)
+    ws_a, ws_b = make_workspace(fresh, "ws-a"), make_workspace(fresh, "ws-b")
+    doc_a = make_document(fresh, ws_a)
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        make_chunk(fresh, doc_a, ws_b)
+
+
+def test_workspace_with_documents_cannot_be_deleted(fresh):
+    apply_migrations(fresh)
+    ws = make_workspace(fresh)
+    make_document(fresh, ws)
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        fresh.execute("DELETE FROM workspaces WHERE id = %s", (ws,))
+
+
+def test_workspace_slug_is_unique(fresh):
+    apply_migrations(fresh)
+    make_workspace(fresh, "tenant-a")
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        make_workspace(fresh, "tenant-a")
+
+
+@pytest.mark.parametrize("bad_slug", ["Tenant A", "a", "-leading-dash", "under_score"])
+def test_workspace_slug_format_is_enforced(fresh, bad_slug):
+    apply_migrations(fresh)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        make_workspace(fresh, bad_slug)
 ```
 
 - [ ] **Step 5: Run to verify failure**
@@ -776,17 +867,82 @@ def test_deleting_document_cascades_to_chunks(fresh):
 Run: `uv run pytest tests/integration/test_migrations.py -q`
 Expected: FAIL — `apply_migrations` returns `[]` (no SQL file yet) and table lookups raise `UndefinedTable`.
 
-- [ ] **Step 6 [DEVELOPER]: Write `geoagent/db/migrations/001_init.sql`**
+- [ ] **Step 6: Write `geoagent/db/migrations/001_init.sql`** (exactly the contract SQL above)
 
-Write it yourself from the contract above and spec §6. Things to understand while writing:
+Things to understand (developer review):
 - `vector(768)` fixes dimensionality at the type level — inserting a 767-dim vector fails. Why 768 and not 3072? (pgvector HNSW limit: 2,000 dims for `vector`.)
 - `vector_cosine_ops` must match the operator used at query time (`<=>`), otherwise the index is ignored.
-- Why is `workspace_id` duplicated on `chunks` when it is derivable via `documents`?
+- Why is `workspace_id` duplicated on `chunks` when it is derivable via `documents`, and how does the composite foreign key make that safe?
+- Why a UUID primary key plus a `slug`, instead of the slug as the key?
 
 - [ ] **Step 7: Run to verify pass**
 
 Run: `uv run pytest tests/integration/test_migrations.py -q`
-Expected: `6 passed`.
+Expected: `13 passed`.
+
+- [ ] **Step 7b [LLM]: Workspace helpers (resolve slug ↔ UUID at the edges)**
+
+`tests/integration/test_workspaces.py`:
+
+```python
+import uuid
+
+import psycopg
+import pytest
+
+from geoagent.db.workspaces import WorkspaceNotFound, create_workspace, get_workspace_id
+
+pytestmark = pytest.mark.integration
+
+
+def test_create_then_resolve_by_slug(conn):
+    workspace_id = create_workspace(conn, slug="tenant-a", name="Tenant A")
+    assert isinstance(workspace_id, uuid.UUID)
+    assert get_workspace_id(conn, "tenant-a") == workspace_id
+
+
+def test_unknown_slug_raises(conn):
+    with pytest.raises(WorkspaceNotFound):
+        get_workspace_id(conn, "nobody")
+
+
+def test_duplicate_slug_is_rejected(conn):
+    create_workspace(conn, slug="tenant-a", name="Tenant A")
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        create_workspace(conn, slug="tenant-a", name="Again")
+```
+
+Run: `uv run pytest tests/integration/test_workspaces.py -q` → FAIL (`ModuleNotFoundError`).
+
+`geoagent/db/workspaces.py`:
+
+```python
+import uuid
+
+import psycopg
+
+
+class WorkspaceNotFound(LookupError):
+    """No workspace has this slug."""
+
+
+def create_workspace(conn: psycopg.Connection, *, slug: str, name: str) -> uuid.UUID:
+    workspace_id = uuid.uuid4()
+    conn.execute(
+        "INSERT INTO workspaces (id, slug, name) VALUES (%s, %s, %s)",
+        (workspace_id, slug, name),
+    )
+    return workspace_id
+
+
+def get_workspace_id(conn: psycopg.Connection, slug: str) -> uuid.UUID:
+    row = conn.execute("SELECT id FROM workspaces WHERE slug = %s", (slug,)).fetchone()
+    if row is None:
+        raise WorkspaceNotFound(slug)
+    return row[0]
+```
+
+Run: `uv run pytest tests/integration/test_workspaces.py -q` → `3 passed`.
 
 - [ ] **Step 8 [LLM]: Review questions for the developer**
 
@@ -795,8 +951,8 @@ Ask (do not answer): What happens to an HNSW index build time as rows grow? What
 - [ ] **Step 9: Commit**
 
 ```bash
-git add geoagent/db tests/integration/conftest.py tests/integration/test_migrations.py
-git commit -m "feat: add schema migration and runner"
+git add geoagent/db tests/unit/test_db_connection.py tests/integration/conftest.py tests/integration/test_migrations.py tests/integration/test_workspaces.py
+git commit -m "feat: add schema migration, runner, connection retries and workspace helpers"
 ```
 
 ---
@@ -1929,6 +2085,8 @@ git commit -m "feat: add section-aware, token-limited chunker"
 
 ## Task 12: Ingestion pipeline [Developer zone]
 
+> **Amendment — schema v2 (apply before executing this task):** `workspace_id` is a `uuid.UUID`, not a string. Contract step 1 ("ensure the workspace row exists") is **removed**: callers resolve or create the workspace first (`geoagent.db.workspaces`). In the tests, replace the `WS` constant with a fixture `ws` returning `create_workspace(conn, slug="test-ws", name="Test")`, and delete the assertion on `SELECT id FROM workspaces`. Blob keys use the UUID: `raw/{workspace_id}/{document_id}.pdf`, uploads under `incoming/{workspace_id}/`.
+
 **Files:**
 - Create (DEV): `geoagent/ingest/pipeline.py`
 - Test (LLM): `tests/integration/test_pipeline.py`
@@ -2092,6 +2250,8 @@ git commit -m "feat: add idempotent ingestion pipeline with status tracking"
 ---
 
 ## Task 13: Retriever [Developer zone]
+
+> **Amendment — schema v2 (apply before executing this task):** `workspace_id` is a `uuid.UUID`. `tests/integration/seed.py` gains `ensure_workspace(conn, slug) -> UUID` (get-or-create via `geoagent.db.workspaces`); `seed_chunk` takes `workspace_slug: str`, inserts the document/chunk with the resolved UUID and the new `workspaces(id, slug, name)` columns. The `seeded` fixture also returns `ws_a`/`ws_b` UUIDs; tests call `retrieve(..., workspace_id=seeded["ws_a"])`; the unknown-workspace test uses `uuid.uuid4()`.
 
 **Files:**
 - Create (DEV): `geoagent/rag/retriever.py`
@@ -2342,6 +2502,8 @@ git commit -m "feat: add grounded prompt builder and citation parser"
 
 ## Task 15: Answer orchestration [Developer zone]
 
+> **Amendment — schema v2 (apply before executing this task):** `workspace_id` is typed `uuid.UUID` (the unit tests use fakes, so any value works there).
+
 **Files:**
 - Create (DEV): `geoagent/rag/answer.py`
 - Test (LLM): `tests/unit/test_answer.py`
@@ -2481,6 +2643,8 @@ git commit -m "feat: add answer orchestration with not-found short-circuit"
 ---
 
 ## Task 16: Logging, wiring, API [LLM zone]
+
+> **Amendment — schema v2 (apply before executing this task):** The API takes the workspace **slug** at the edge and resolves it once with `get_workspace_id` (`AskRequest.workspace: str`, `GET /documents?workspace=`, form field `workspace` on upload). Add an exception handler `WorkspaceNotFound` → 404 `{"error": "workspace_not_found"}`. Upload key: `incoming/{workspace_uuid}/{name}`. Unit tests monkeypatch `main.get_workspace_id` (the connection is faked); the integration test seeds with `ensure_workspace`.
 
 **Files:**
 - Create: `geoagent/logs.py`, `geoagent/wiring.py`, `geoagent/api/schemas.py`, `geoagent/api/main.py`
@@ -2993,6 +3157,8 @@ git commit -m "feat: add FastAPI app, provider wiring and JSON logging"
 
 ## Task 17: CLI, smoke loader, report fetcher [LLM zone]
 
+> **Amendment — schema v2 (apply before executing this task):** `--workspace` takes a slug, resolved with `get_workspace_id` (clear error if unknown). Add a `workspace` sub-command group: `geoagent workspace create SLUG --name NAME` and `geoagent workspace list`.
+
 **Files:**
 - Create: `geoagent/smoke.py`, `geoagent/cli.py`, `scripts/fetch_reports.py`
 - Test: `tests/unit/test_smoke_loader.py`
@@ -3427,6 +3593,8 @@ git commit -m "build: add Dockerfile, compose api service and local LLM host gui
 ---
 
 ## Task 19: Real data, smoke set and first experiments [Developer zone]
+
+> **Amendment — schema v2 (apply before executing this task):** First create the simulated tenants: `geoagent workspace create tenant-a --name "Tenant A"`, same for `tenant-b`, `tenant-c`. Ingest Waihi into `tenant-a` and Macraes into `tenant-b` (tenant-c gets a third public report later). Add an isolation check: a Macraes question asked as `tenant-a` must return the not-found answer.
 
 **Files:**
 - Create (DEV): `evals/smoke.jsonl`
