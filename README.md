@@ -10,3 +10,12 @@ Ollama locally, Vertex AI + Cloud Run + Cloud SQL in the cloud, Terraform for in
 
 Source reports are copyrighted and are not stored in this repository; `scripts/fetch_reports.py`
 downloads them into the git-ignored `data/` directory.
+
+## Local setup
+
+1. Copy `.env.example` to `.env` (git-ignored) and fill in `DB_USER` and `DB_PASSWORD`. Generate a
+   password with `python -c "import secrets; print(secrets.token_urlsafe(24))"`.
+2. Start the database: `docker compose up -d postgres`.
+
+Postgres only reads the credentials when the `pgdata` volume is first created. If you change
+them later, run `docker compose down -v` before starting again (this deletes the local database).

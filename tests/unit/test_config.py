@@ -4,17 +4,11 @@ from pydantic import ValidationError
 
 from geoagent.config import Settings
 
-ENV_VARS = [
-    "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_CONNECT_TIMEOUT_S",
-    "DB_CONNECT_RETRIES", "DB_STATEMENT_TIMEOUT_MS", "LLM_PROVIDER", "LLM_MODEL",
-    "OLLAMA_BASE_URL", "BLOB_STORE", "EMBEDDING_DIM", "TOP_K", "GEMINI_API_KEY",
-]
-
 
 @pytest.fixture
 def env(monkeypatch):
-    for var in ENV_VARS:
-        monkeypatch.delenv(var, raising=False)
+    for name in Settings.model_fields:
+        monkeypatch.delenv(name.upper(), raising=False)
     monkeypatch.setenv("DB_USER", "app_user")
     monkeypatch.setenv("DB_PASSWORD", "s3cret-value")
     return monkeypatch
@@ -83,3 +77,37 @@ def test_environment_overrides(env):
     s = make()
     assert (s.llm_provider, s.blob_store, s.top_k) == ("vertex", "gcs", 3)
     assert conninfo_to_dict(s.conninfo())["host"] == "/cloudsql/proj:region:inst"
+
+
+def test_validation_errors_do_not_echo_secrets(env):
+    env.delenv("DB_USER")
+    env.setenv("GEMINI_API_KEY", "AIza-not-a-real-key")
+    with pytest.raises(ValidationError) as info:
+        make()
+    assert "s3cret-value" not in str(info.value)
+    assert "AIza-not-a-real-key" not in str(info.value)
+
+
+def test_empty_values_are_treated_as_missing(env):
+    env.setenv("GEMINI_API_KEY", "")
+    assert make().gemini_api_key is None
+    env.setenv("DB_PASSWORD", "")
+    with pytest.raises(ValidationError):
+        make()
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [("DB_PORT", "99999"), ("DB_CONNECT_TIMEOUT_S", "0"), ("DB_CONNECT_RETRIES", "0"),
+     ("DB_STATEMENT_TIMEOUT_MS", "0")],
+)
+def test_out_of_range_values_are_rejected(env, var, value):
+    env.setenv(var, value)
+    with pytest.raises(ValidationError):
+        make()
+
+
+def test_settings_are_immutable(env):
+    s = make()
+    with pytest.raises(ValidationError):
+        s.top_k = 50

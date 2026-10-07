@@ -3,27 +3,36 @@ from pathlib import Path
 from typing import Literal
 
 from psycopg.conninfo import make_conninfo
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"  # repo root, independent of CWD
 
 
 class Settings(BaseSettings):
     """All runtime configuration, read from environment variables and `.env`.
 
-    Credentials have no defaults: the app refuses to start without them, and SecretStr
-    keeps them out of repr/str/JSON so they cannot leak into logs or tracebacks.
+    Credentials have no defaults: the app refuses to start without them. SecretStr keeps
+    them out of repr/str/JSON, and hide_input_in_errors keeps them out of validation errors.
+    Empty values count as unset. Instances are immutable because get_settings() shares one.
     """
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=_ENV_FILE,
+        extra="ignore",
+        env_ignore_empty=True,
+        hide_input_in_errors=True,
+        frozen=True,
+    )
 
     db_host: str = "127.0.0.1"
-    db_port: int = 5432
+    db_port: int = Field(5432, ge=1, le=65535)
     db_name: str = "geoagent"
     db_user: str
     db_password: SecretStr
-    db_connect_timeout_s: int = 5
-    db_connect_retries: int = 3
-    db_statement_timeout_ms: int = 5000
+    db_connect_timeout_s: int = Field(5, ge=1)  # libpq: 0 = wait forever
+    db_connect_retries: int = Field(3, ge=1)
+    db_statement_timeout_ms: int = Field(5000, ge=1)
 
     blob_store: Literal["local", "gcs"] = "local"
     blob_root: Path = Path("blobdata")
@@ -56,7 +65,7 @@ class Settings(BaseSettings):
         return make_conninfo(
             host=self.db_host,
             port=self.db_port,
-            dbname=dbname or self.db_name,
+            dbname=dbname if dbname is not None else self.db_name,
             user=self.db_user,
             password=self.db_password.get_secret_value(),
             connect_timeout=self.db_connect_timeout_s,
