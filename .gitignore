@@ -16,3 +16,6 @@ __pycache__/
 *.tfstate
 *.tfstate.*
 *.tfvars
+
+# Local blob store
+blobdata/

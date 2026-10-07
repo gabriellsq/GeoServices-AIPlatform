@@ -1,0 +1,10 @@
+.git
+.venv
+data
+blobdata
+docs
+tests
+infra
+evals
+**/__pycache__
+.env
