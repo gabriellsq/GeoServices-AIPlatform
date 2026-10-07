@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Iterator
 
 import psycopg
 import pytest
@@ -13,7 +14,7 @@ MIGRATION_DB = "geoagent_migration_test"
 
 
 @pytest.fixture
-def fresh(settings) -> psycopg.Connection:
+def fresh(settings) -> Iterator[psycopg.Connection]:
     recreate_database(settings, MIGRATION_DB)
     with connect(settings, dbname=MIGRATION_DB, register_vector_type=False) as c:
         yield c
@@ -123,3 +124,30 @@ def test_workspace_slug_format_is_enforced(fresh, bad_slug):
     apply_migrations(fresh)
     with pytest.raises(psycopg.errors.CheckViolation):
         make_workspace(fresh, bad_slug)
+
+
+def test_embedding_dimension_is_enforced(fresh):
+    apply_migrations(fresh)
+    ws = make_workspace(fresh)
+    doc = make_document(fresh, ws)
+    with pytest.raises(psycopg.errors.DataException):
+        fresh.execute(
+            "INSERT INTO chunks (id, document_id, workspace_id, ordinal, page_start, page_end, "
+            "text, token_count, embedding) "
+            "VALUES (%s, %s, %s, 0, 1, 1, 'x', 1, array_fill(0.1, ARRAY[767])::vector)",
+            (uuid.uuid4(), doc, ws),
+        )
+
+
+@pytest.mark.parametrize(("ordinal", "page_start", "page_end"), [(-1, 1, 1), (0, 0, 1), (0, 3, 2)])
+def test_chunk_position_checks(fresh, ordinal, page_start, page_end):
+    apply_migrations(fresh)
+    ws = make_workspace(fresh)
+    doc = make_document(fresh, ws)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        fresh.execute(
+            "INSERT INTO chunks (id, document_id, workspace_id, ordinal, page_start, page_end, "
+            "text, token_count, embedding) "
+            "VALUES (%s, %s, %s, %s, %s, %s, 'x', 1, array_fill(0.1, ARRAY[768])::vector)",
+            (uuid.uuid4(), doc, ws, ordinal, page_start, page_end),
+        )

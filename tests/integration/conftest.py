@@ -10,7 +10,9 @@ from geoagent.db.migrate import apply_migrations
 
 
 def recreate_database(settings: Settings, name: str) -> None:
-    with connect(settings, dbname="postgres", register_vector_type=False) as admin:
+    with connect(
+        settings, dbname="postgres", statement_timeout_ms=60_000, register_vector_type=False
+    ) as admin:
         admin.execute(
             sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name))
         )
@@ -20,7 +22,13 @@ def recreate_database(settings: Settings, name: str) -> None:
 @pytest.fixture(scope="session")
 def settings() -> Settings:
     """Credentials come from the repo `.env` (the same file docker compose reads)."""
-    return Settings()
+    s = Settings()
+    if s.db_host not in {"127.0.0.1", "localhost", "::1"}:
+        pytest.exit(
+            f"refusing to run integration tests against non-local database host {s.db_host!r}",
+            returncode=2,
+        )
+    return s
 
 
 @pytest.fixture(scope="session")

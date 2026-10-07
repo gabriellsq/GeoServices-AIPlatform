@@ -74,3 +74,22 @@ def test_retry_logs_never_contain_the_password(monkeypatch, caplog):
         connection.connect(settings(), register_vector_type=False, sleep=lambda s: None)
     assert caplog.records, "retries should be logged"
     assert PASSWORD not in caplog.text
+
+
+def test_closes_connection_if_vector_registration_fails(monkeypatch):
+    class FakeConn:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    fake = FakeConn()
+    monkeypatch.setattr(connection.psycopg, "connect", lambda conninfo, autocommit: fake)
+
+    def boom(conn):
+        raise psycopg.ProgrammingError("vector type not found")
+
+    monkeypatch.setattr(connection, "register_vector", boom)
+    with pytest.raises(psycopg.ProgrammingError):
+        connection.connect(settings())
+    assert fake.closed

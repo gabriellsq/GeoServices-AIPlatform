@@ -45,5 +45,9 @@ def connect(
             )
             sleep(delay)
     if register_vector_type:
-        register_vector(conn)
+        try:
+            register_vector(conn)
+        except BaseException:
+            conn.close()
+            raise
     return conn

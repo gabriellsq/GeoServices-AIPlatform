@@ -38,10 +38,13 @@ CREATE TABLE chunks (
     text         TEXT NOT NULL,
     token_count  INT  NOT NULL,
     embedding    vector(768) NOT NULL,
+    CHECK (ordinal >= 0),
+    CHECK (page_start >= 1 AND page_end >= page_start),
     UNIQUE (document_id, ordinal),
     FOREIGN KEY (document_id, workspace_id)
         REFERENCES documents (id, workspace_id) ON DELETE CASCADE
 );
 
 CREATE INDEX chunks_embedding_hnsw ON chunks USING hnsw (embedding vector_cosine_ops);
+-- Tenant filter for small tenants and tenant offboarding deletes (the composite FK does not need it).
 CREATE INDEX chunks_workspace ON chunks (workspace_id);
