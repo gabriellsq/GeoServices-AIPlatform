@@ -307,3 +307,47 @@ Vector DBs store payloads too (Qdrant JSON, Pinecone metadata, Weaviate objects)
 | Batch analytics over embeddings | BigQuery `VECTOR_SEARCH` |
 
 **Rule:** match the data's centre of gravity — mostly relational with vectors as a feature → Postgres; mostly vectors at massive scale → vector DB; documents synced to clients → Firestore; analytics → BigQuery.
+
+---
+
+## 9. System design walkthrough (RAG on GCP)
+
+**Order to present:** requirements → API & SLOs → write path → read path → storage choice → scaling limits → reliability → security & tenancy → cost → evals & observability.
+
+**Questions that drive the store choice:** tenants/users? lineage? ACID (deletes, permissions)? multi-region? who operates it? SQL needed? vector count & growth? QPS & p95 latency? freshness (seconds vs hours)? hybrid/geospatial queries? cost ceiling?
+
+```
+                     ┌──────────────── Terraform creates everything in this frame ────────────────┐
+WRITE (async)        │                                                                             │
+Sources ─► GCS raw/ ─► Eventarc/Pub/Sub ─► Cloud Run Job: parse → chunk → embed ─► Cloud SQL/AlloyDB
+READ (sync)          │                                                              (pgvector)     │
+User ─► LB + Cloud Armor ─► Identity ─► Cloud Run API ─► embed query (Vertex)           ▲          │
+                     │                        ├─ top-k, tenant-filtered ────────────────┘          │
+                     │                        ├─ prompt ─► Gemini (managed Vertex API)             │
+                     │                        └─ logs/traces ─► Cloud Logging/Trace ─► BigQuery    │
+                     │  Secret Manager · service accounts · Artifact Registry · alerts · budgets   │
+                     └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Common mistakes:**
+- Processing before landing → **land raw first (ELT)**, transform from GCS; a processing bug must never lose the original.
+- DB → LLM arrow → **databases never call the LLM; the API orchestrates** (embed → retrieve → prompt → generate).
+- Drawing Cloud SQL, AlloyDB, Spanner together → they are alternatives; pick one and justify.
+- **Pub/Sub on the chat path** → interactive Q&A is synchronous HTTPS + streaming (SSE). Pub/Sub is for async work: ingestion events, batch Q&A, eval runs, log pipelines. Cloud Tasks for rate-limited retried calls to a quota-bound LLM.
+- "Vertex AI endpoint" for Gemini → Gemini is a **managed API**; endpoints are for self-hosted models (Model Garden on GPUs).
+- Confusing **Vertex Vector Search** (ANN store) with an **embedding model** (Vertex embeddings, self-hosted model, or in-DB `google_ml.embedding()`).
+
+**Does the store bottleneck runtime?** Normally no — embed 50–200 ms, vector search 5–50 ms, LLM 1–10 s. The store becomes a latency problem past thresholds, first in **p99**: index no longer fits RAM; connection exhaustion when Cloud Run scales out (→ pooling: PgBouncer / AlloyDB managed pooling); filtered-search recall for small tenants; write churn vs vacuum; cross-region reads.
+
+**BM25 / hybrid on GCP:**
+| Where | How | Note |
+|---|---|---|
+| Postgres FTS | `tsvector` + GIN, `ts_rank_cd` | BM25-like, available on Cloud SQL |
+| True BM25 in Postgres | ParadeDB `pg_search` | Managed DBs only allow approved extensions — check first |
+| Vertex Vector Search hybrid | sparse + dense vectors in one index, fused | You generate sparse vectors |
+| Vertex AI Search | managed hybrid search | Least control |
+| Elasticsearch/OpenSearch | classic BM25 | Another store to sync |
+
+Fuse rankings with **RRF**: `score = Σ 1/(60 + rank_i)` over the dense and sparse lists (two CTEs + `FULL OUTER JOIN` in Postgres).
+
+**Terraform** is the frame, not a box: project/APIs, network, DB, buckets, topics, triggers, Cloud Run service/job definitions, service accounts/IAM, secret containers, registry, alerts, budgets. Not: image versions (CI by digest), data/vectors, model weights, secret values. Flow: PR → plan → review → apply (dev auto, prod with approval) via Workload Identity Federation.
