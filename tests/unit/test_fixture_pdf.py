@@ -21,3 +21,7 @@ def test_page_three_has_one_detectable_table():
     tables = doc[2].find_tables().tables
     assert len(tables) == 1
     assert tables[0].extract()[2][0].strip() == "DH-002"
+
+
+def test_same_variant_is_byte_identical():
+    assert build_fixture_pdf("a") == build_fixture_pdf("a")

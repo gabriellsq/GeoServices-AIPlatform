@@ -66,6 +66,6 @@ def build_fixture_pdf(variant: str = "a") -> bytes:
         if number == 3:
             _draw_table(page, 50, y + 10)
         page.insert_text((260, 815), f"Page {number} of {len(pages)}", fontsize=9)
-    data = doc.tobytes()
+    data = doc.tobytes(no_new_id=True)  # no random trailer /ID: same input -> same bytes -> same sha256
     doc.close()
     return data
