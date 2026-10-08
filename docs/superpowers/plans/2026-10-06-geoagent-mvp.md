@@ -2002,6 +2002,12 @@ def test_token_counts_are_exact_and_bounded(fixture_chunks):
         assert c.token_count <= 512
 
 
+def test_table_content_survives_header_stripping(fixture_chunks):
+    # DH-001/DH-002 normalise to the same "DH-###" line on ONE page: boilerplate detection must
+    # count distinct pages, not occurrences, or table rows get stripped as headers.
+    assert any("DH-002" in c.text for c in fixture_chunks)
+
+
 def test_no_chunk_mixes_sections(fixture_chunks):
     for c in fixture_chunks:
         assert not ("greywacke" in c.text and "quartz-sulphide" in c.text)
@@ -2070,7 +2076,7 @@ This is the most important module of the sprint — take your time. Suggested or
 - [ ] **Step 4: Run to verify pass**
 
 Run: `uv run pytest tests/unit/test_chunker.py -q`
-Expected: `13 passed`.
+Expected: `14 passed`.
 
 - [ ] **Step 5 [LLM]: Review** — ask: what happens with a 3,000-token table with no newlines? With a heading regex that matches table rows like `1 | 45.0 | ...`? How would section-title prefixing (`"7.1 Regional Geology: <text>"`) change embeddings?
 
