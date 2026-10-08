@@ -266,3 +266,44 @@ User ─► Identity Platform / IAP (token: tenant_id, user_id, roles)
 - ACID guarantees the **state** is correct; **ANN results are still approximate**. Consistency ≠ exact nearest neighbours — it means never returning a deleted or foreign chunk.
 - Dedicated vector DBs often trade this away: write-to-searchable freshness lag, tunable consistency levels (e.g. Strong/Bounded/Session/Eventually), no transactions spanning your metadata store.
 - ACID matters most for **deletions, permissions, re-ingestion, model swaps**; eventual consistency is acceptable for an append-only public corpus.
+
+---
+
+## 8. Choosing the store — scale vs control
+
+| Optimises for | Dedicated vector DBs | Postgres + pgvector |
+|---|---|---|
+| Goal | Distributed ANN: sharding, replication, QPS, quantization | Integrity: transactions, constraints, joins, SQL |
+| Consistency | Often eventual/tunable (write → searchable lag) | Strong after commit |
+| Integrity rules | Application-level | In the engine (FK, CHECK, UNIQUE, RLS) |
+| Ad-hoc questions | Limited filter APIs | Any SQL |
+
+- Not a law that "distributed = less control": **Spanner** and **AlloyDB** are distributed *and* ACID with vector search. The real trade is that **control at scale costs money and complexity**.
+
+### Why store chunks next to vectors at all?
+Nobody reads the 768 numbers — but the rows around them are queried all the time:
+- **Every request:** chunk text + title + pages → prompt and citations.
+- **Debugging:** "what did retrieval return for this question, with what scores?"
+- **Operations:** failed documents and why, chunk counts per document.
+- **Compliance:** delete a tenant, find everything embedded with model v1.
+- **Quality:** near-duplicate chunks, similarity distributions, norm checks, drift — vectors are inspected *statistically*.
+
+Vector DBs store payloads too (Qdrant JSON, Pinecone metadata, Weaviate objects). The deciding question is **what else lives around the vectors**: tenants, users, permissions, statuses, jobs, audit → if you need those with transactions and joins, a separate vector DB becomes a *second* store (dual-write sync problem). Document NoSQL (Firestore, MongoDB Atlas) = flexible schema + scale + vector search, but no joins, limited transactions, integrity in code.
+
+### When Postgres / Cloud SQL is the right choice
+1. Relational operational data already exists; vectors are one feature of it.
+2. Deletes and permission changes must apply immediately (regulated data, strict tenant isolation).
+3. **Hybrid queries in one statement:** vector similarity + relational filters + full-text (`tsvector`) + **PostGIS** — e.g. "chunks about porphyry copper, from drill reports within 5 km of this point, for tenant A". Strong argument in geoscience, where nearly everything has a location.
+4. Up to tens of millions of vectors at moderate QPS per node.
+5. Cost (one small instance vs always-on vector nodes) and team skills (SQL, backups, migrations).
+
+### When something else
+| Need | GCP choice |
+|---|---|
+| 100M–billions of vectors, very high QPS, sharded ANN | Vertex AI Vector Search (accept eventual consistency + sync) |
+| Global scale + strong consistency + vectors | Spanner |
+| Bigger Postgres, HTAP, higher SLA | AlloyDB (ScaNN, columnar engine) |
+| Document-shaped app data, real-time client sync | Firestore + vector search |
+| Batch analytics over embeddings | BigQuery `VECTOR_SEARCH` |
+
+**Rule:** match the data's centre of gravity — mostly relational with vectors as a feature → Postgres; mostly vectors at massive scale → vector DB; documents synced to clients → Firestore; analytics → BigQuery.
