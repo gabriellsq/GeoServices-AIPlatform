@@ -395,3 +395,36 @@ Plus alerts/SLOs: p95 latency, 5xx rate, DB down, budget, burn rate.
 - Gemini → API: `candidates[0].content.parts[0].text` + `usageMetadata` (prompt, candidates, thoughts tokens — thinking tokens are billed as output).
 - API → client: answer, found, citations (n, title, pages, section, snippet), model, prompt_version, latency_ms, tokens.
 - Other providers (e.g. Claude on Vertex) use a different body (`system`, `messages`, `max_tokens`) — translated inside the provider adapter.
+
+---
+
+## 11. Runtime bottlenecks, build vs buy, exact search
+
+### Bottleneck order for one RAG request (same region)
+| # | Step | Typical | Fix first |
+|---|---|---|---|
+| 1 | LLM generation (time-to-first-token + output + thinking tokens) | 1–10 s | stream, cap output, limit thinking, fewer/shorter chunks, faster tier, cache |
+| 2 | Cloud Run cold start | 1–5 s, p99 only | `min-instances=1`, startup CPU boost, lazy imports |
+| 3 | Query embedding call | 50–200 ms | cache repeated questions |
+| 4 | New DB connection per request | 10–50 ms | connection pool |
+| 5 | Vector search (pgvector HNSW, small scale) | 5–50 ms | only matters past index-in-RAM / filtered-recall limits |
+| — | Same-region hops | 1–5 ms each | never cross regions on the request path |
+
+Under concurrency the first wall is **throughput**, not latency: LLM quota/rate limits (429), then DB connections as Cloud Run scales out.
+
+### Build vs buy retrieval
+- **Managed (Vertex AI RAG Engine, Vertex AI Search):** standard documents, default chunking acceptable, small team, time-to-market, Gemini-centric, simple tenancy. Production-viable, not just PoC.
+- **Own pipeline:** domain parsing (tables, report sections, IDs), hybrid with structured/geospatial data, strict tenant isolation & deletion, model freedom, per-step evals and tracing, cost at scale.
+- **Rule:** buy what is not your differentiator; build what is. Mixed setups are normal (own chunking → managed store, or managed parsing → own retrieval).
+- **Vertex AI Search vs Elasticsearch:** rent a finished search product (Google ranking, connectors, generated answers, little tuning) vs run a general search + analytics engine (full control of analyzers, BM25, aggregations; you operate it).
+
+### Exact (brute-force) vector search
+Never implement ANN (HNSW, ScaNN) yourself for production. Exact search, however, is a real tool — cost is O(N·d) per query; ~100k × 768 dims is milliseconds with BLAS/NumPy.
+Use it for:
+- **Small collections:** one project's documents, one user's memory (< ~100k vectors) → perfect recall, no index.
+- **Highly selective filters:** after `WHERE tenant/document` leaves a few hundred rows, an exact scan beats ANN and avoids filtered-recall loss (Postgres picks this plan itself).
+- **Ground truth for evals:** exact top-k is the reference to measure ANN **recall@k**.
+- **Re-ranking:** exact similarity over an ANN shortlist ("shortlist then rerank").
+- **Offline/batch:** dedup, clustering, similarity matrices (GPU flat search for millions).
+- **Fresh, not-yet-indexed writes:** search the recent buffer exactly and merge with the ANN results.
+In-process indexes (FAISS, hnswlib) suit read-mostly corpora: very fast, but one copy per instance, rebuild on update, no tenancy/transactions.
