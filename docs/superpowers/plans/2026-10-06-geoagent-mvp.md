@@ -21,6 +21,7 @@
 - Run all commands from the repo root.
 - Unit tests: `uv run pytest -m "not integration"`. Integration tests need Postgres: `docker compose up -d postgres` first, then `uv run pytest -m integration`.
 - Database connections are opened with `autocommit=True`; atomic units of work use `with conn.transaction():`.
+- Local Postgres is always addressed as `127.0.0.1` (never `localhost`: on Windows, WSL's `wslrelay` can hold `[::1]:5432` and black-hole IPv6 connections) with a `connect_timeout`, so a stopped container fails fast.
 - Everything is **synchronous** (sync psycopg, sync httpx, sync FastAPI endpoints run in the threadpool). Async is a later-sprint topic.
 - Commits: conventional-commit subject, no AI attribution trailer. Before each commit, check staged files contain no personal information.
 
@@ -89,6 +90,8 @@ GeoSolution/
 ---
 
 ## Task 1: Project scaffold [LLM zone]
+
+> **Status: done.** Implemented with review amendments; the committed files are the source of truth where they differ from the text below (credentials moved to `.env` as split `DB_*` fields, `127.0.0.1` everywhere, `SecretStr`, timeout budget, settings hardening).
 
 **Files:**
 - Create: `pyproject.toml`, `.env.example`, `.dockerignore`, `README.md`, `docs/learning-log.md`
@@ -161,7 +164,11 @@ Create each `__init__.py` listed under **Files** as an empty file.
 
 ```dotenv
 # Copy to .env and fill in. .env is git-ignored.
-DATABASE_URL=postgresql://<DB_USER>:<DB_PASSWORD>@localhost:5432/geoagent
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_NAME=geoagent
+DB_USER=
+DB_PASSWORD=
 
 BLOB_STORE=local
 BLOB_ROOT=blobdata
@@ -274,6 +281,8 @@ git commit -m "chore: scaffold geoagent package, tooling and learning log"
 
 ## Task 2: Docker Compose Postgres + pgvector [LLM zone]
 
+> **Status: done.** Implemented with review amendments; the committed files are the source of truth where they differ from the text below (credentials moved to `.env` as split `DB_*` fields, `127.0.0.1` everywhere, `SecretStr`, timeout budget, settings hardening).
+
 **Files:**
 - Create: `docker-compose.yml`
 - Create: `tests/integration/test_postgres_available.py`
@@ -287,13 +296,13 @@ services:
     environment:
       POSTGRES_USER: ${DB_USER:?set DB_USER in .env}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
-      POSTGRES_DB: geoagent
+      POSTGRES_DB: ${DB_NAME:-geoagent}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -314,7 +323,7 @@ pytestmark = pytest.mark.integration
 
 
 def test_pgvector_extension_is_available():
-    with psycopg.connect("postgresql://<DB_USER>:<DB_PASSWORD>@localhost:5432/geoagent") as conn:
+    with psycopg.connect(Settings().conninfo()) as conn:
         row = conn.execute(
             "SELECT default_version FROM pg_available_extensions WHERE name = 'vector'"
         ).fetchone()
@@ -344,6 +353,8 @@ git commit -m "chore: add postgres+pgvector compose service"
 ---
 
 ## Task 3: Settings [LLM zone]
+
+> **Status: done.** Implemented with review amendments; the committed files are the source of truth where they differ from the text below (credentials moved to `.env` as split `DB_*` fields, `127.0.0.1` everywhere, `SecretStr`, timeout budget, settings hardening).
 
 **Files:**
 - Create: `geoagent/config.py`
@@ -397,7 +408,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    database_url: str = "postgresql://<DB_USER>:<DB_PASSWORD>@localhost:5432/geoagent"
+    # see committed geoagent/config.py: split DB_* fields, db_password: SecretStr (required)
 
     blob_store: Literal["local", "gcs"] = "local"
     blob_root: Path = Path("blobdata")
@@ -406,7 +417,7 @@ class Settings(BaseSettings):
     llm_provider: Literal["ollama", "vertex"] = "ollama"
     llm_model: str = "qwen3:14b"
     llm_timeout_s: float = 60.0
-    ollama_base_url: str = "http://localhost:11434"
+    ollama_base_url: str = "http://127.0.0.1:11434"
 
     gemini_api_key: str | None = None
     google_cloud_project: str | None = None
@@ -443,27 +454,203 @@ git commit -m "feat: add typed settings"
 ## Task 4: Schema migration [SQL: Developer zone; runner + tests: LLM zone]
 
 **Files:**
-- Create (LLM): `geoagent/db/connection.py`, `geoagent/db/migrate.py`, `tests/integration/conftest.py`, `tests/integration/test_migrations.py`
-- Create (DEV): `geoagent/db/migrations/001_init.sql`
+- Create (LLM): `geoagent/db/connection.py`, `geoagent/db/migrate.py`, `geoagent/db/workspaces.py`, `tests/unit/test_db_connection.py`, `tests/integration/conftest.py`, `tests/integration/test_migrations.py`, `tests/integration/test_workspaces.py`
+- Create: `geoagent/db/migrations/001_init.sql` (developer chose subagent mode for this task)
 
-**Contract for `001_init.sql` (developer writes it):** the schema in spec §6, exactly: extension `vector`; tables `workspaces`, `documents`, `chunks` with the listed columns, `CHECK` on `documents.status`, `UNIQUE (workspace_id, sha256)` on documents, `UNIQUE (document_id, ordinal)` on chunks, `ON DELETE CASCADE` from chunks to documents, an HNSW index named `chunks_embedding_hnsw` using `vector_cosine_ops`, and a btree index `chunks_workspace` on `chunks(workspace_id)`.
+**Contract for `001_init.sql`:** exactly the schema below (also spec §6, schema v2: UUID workspace key + slug, composite tenant foreign key).
 
-- [ ] **Step 1 [LLM]: Implement `geoagent/db/connection.py`**
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Tenant. UUID primary key (meaningless, immutable); slug is the human-readable handle.
+CREATE TABLE workspaces (
+    id         UUID PRIMARY KEY,
+    slug       TEXT NOT NULL UNIQUE CHECK (slug ~ '^[a-z0-9][a-z0-9-]{1,62}$'),
+    name       TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per source PDF. No ON DELETE on the workspace FK: tenant offboarding is explicit.
+CREATE TABLE documents (
+    id           UUID PRIMARY KEY,
+    workspace_id UUID NOT NULL REFERENCES workspaces(id),
+    title        TEXT NOT NULL,
+    source_url   TEXT,
+    blob_uri     TEXT NOT NULL,
+    sha256       TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('uploaded','processing','ready','failed')),
+    error        TEXT,
+    page_count   INT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, sha256),
+    UNIQUE (id, workspace_id)            -- target of the composite FK below
+);
+
+-- One row per chunk. workspace_id is denormalised for filtering; the composite FK
+-- guarantees it always equals the parent document's workspace.
+CREATE TABLE chunks (
+    id           UUID PRIMARY KEY,
+    document_id  UUID NOT NULL,
+    workspace_id UUID NOT NULL,
+    ordinal      INT  NOT NULL,
+    page_start   INT  NOT NULL,
+    page_end     INT  NOT NULL,
+    section      TEXT,
+    text         TEXT NOT NULL,
+    token_count  INT  NOT NULL,
+    embedding    vector(768) NOT NULL,
+    UNIQUE (document_id, ordinal),
+    FOREIGN KEY (document_id, workspace_id)
+        REFERENCES documents (id, workspace_id) ON DELETE CASCADE
+);
+
+CREATE INDEX chunks_embedding_hnsw ON chunks USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX chunks_workspace ON chunks (workspace_id);
+```
+
+- [ ] **Step 1a [LLM]: Write the failing connection tests**
+
+`tests/unit/test_db_connection.py`:
 
 ```python
+import logging
+
+import psycopg
+import pytest
+from psycopg.conninfo import conninfo_to_dict
+
+from geoagent.config import Settings
+from geoagent.db import connection
+
+PASSWORD = "hunter2-not-real"
+
+
+def settings(**overrides) -> Settings:
+    return Settings(_env_file=None, db_user="app", db_password=PASSWORD, **overrides)
+
+
+def test_retries_with_backoff_then_succeeds(monkeypatch):
+    calls, sleeps, sentinel = [], [], object()
+
+    def fake_connect(conninfo, autocommit):
+        calls.append(conninfo)
+        if len(calls) < 3:
+            raise psycopg.OperationalError("connection refused")
+        return sentinel
+
+    monkeypatch.setattr(connection.psycopg, "connect", fake_connect)
+    conn = connection.connect(
+        settings(db_connect_retries=3), register_vector_type=False, sleep=sleeps.append
+    )
+    assert conn is sentinel
+    assert len(calls) == 3
+    assert len(sleeps) == 2
+    assert 0.5 <= sleeps[0] < 0.75 and 1.0 <= sleeps[1] < 1.25
+
+
+def test_gives_up_after_configured_attempts(monkeypatch):
+    attempts = []
+
+    def fake_connect(conninfo, autocommit):
+        attempts.append(1)
+        raise psycopg.OperationalError("down")
+
+    monkeypatch.setattr(connection.psycopg, "connect", fake_connect)
+    with pytest.raises(psycopg.OperationalError):
+        connection.connect(
+            settings(db_connect_retries=2), register_vector_type=False, sleep=lambda s: None
+        )
+    assert len(attempts) == 2
+
+
+def test_passes_dbname_statement_timeout_and_autocommit(monkeypatch):
+    seen = {}
+
+    def fake_connect(conninfo, autocommit):
+        seen.update(conninfo=conninfo, autocommit=autocommit)
+        return object()
+
+    monkeypatch.setattr(connection.psycopg, "connect", fake_connect)
+    connection.connect(
+        settings(), dbname="other", statement_timeout_ms=120000, register_vector_type=False
+    )
+    params = conninfo_to_dict(seen["conninfo"])
+    assert params["dbname"] == "other"
+    assert params["options"] == "-c statement_timeout=120000"
+    assert seen["autocommit"] is True
+
+
+def test_retry_logs_never_contain_the_password(monkeypatch, caplog):
+    def fake_connect(conninfo, autocommit):
+        raise psycopg.OperationalError("connection refused")
+
+    monkeypatch.setattr(connection.psycopg, "connect", fake_connect)
+    with caplog.at_level(logging.DEBUG), pytest.raises(psycopg.OperationalError):
+        connection.connect(settings(), register_vector_type=False, sleep=lambda s: None)
+    assert caplog.records, "retries should be logged"
+    assert PASSWORD not in caplog.text
+```
+
+Run: `uv run pytest tests/unit/test_db_connection.py -q`
+Expected: FAIL with `ModuleNotFoundError: No module named 'geoagent.db.connection'`.
+
+- [ ] **Step 1b [LLM]: Implement `geoagent/db/connection.py`**
+
+```python
+import logging
+import random
+import time
+from collections.abc import Callable
+
 import psycopg
 from pgvector.psycopg import register_vector
 
+from geoagent.config import Settings
 
-def connect(database_url: str) -> psycopg.Connection:
-    """Open an autocommit connection with the pgvector type adapter registered.
+log = logging.getLogger(__name__)
 
-    The `vector` extension must already exist (run migrations first).
+
+def connect(
+    settings: Settings,
+    *,
+    dbname: str | None = None,
+    statement_timeout_ms: int | None = None,
+    register_vector_type: bool = True,
+    sleep: Callable[[float], None] = time.sleep,
+) -> psycopg.Connection:
+    """Open an autocommit connection, retrying transient failures with jittered backoff.
+
+    `settings.db_connect_retries` is the total number of attempts. The conninfo string
+    contains the password, so it is never logged. Set `register_vector_type=False` when the
+    `vector` extension may not exist yet (migrations, admin connections).
     """
-    conn = psycopg.connect(database_url, autocommit=True)
-    register_vector(conn)
+    conninfo = settings.conninfo(dbname=dbname, statement_timeout_ms=statement_timeout_ms)
+    attempts = settings.db_connect_retries
+    for attempt in range(1, attempts + 1):
+        try:
+            conn = psycopg.connect(conninfo, autocommit=True)
+            break
+        except psycopg.OperationalError as exc:
+            if attempt == attempts:
+                raise
+            delay = 0.5 * 2 ** (attempt - 1) + random.uniform(0, 0.25)
+            log.warning(
+                "database connection failed, retrying",
+                extra={
+                    "attempt": attempt,
+                    "retry_in_s": round(delay, 2),
+                    "error": type(exc).__name__,
+                },
+            )
+            sleep(delay)
+    if register_vector_type:
+        register_vector(conn)
     return conn
 ```
+
+Run: `uv run pytest tests/unit/test_db_connection.py -q`
+Expected: `4 passed`.
 
 - [ ] **Step 2 [LLM]: Implement `geoagent/db/migrate.py`**
 
@@ -501,25 +688,19 @@ def apply_migrations(conn: psycopg.Connection, migrations_dir: Path = MIGRATIONS
 - [ ] **Step 3 [LLM]: Create `tests/integration/conftest.py`** (shared by all integration tests)
 
 ```python
-import os
 from collections.abc import Iterator
 
 import psycopg
 import pytest
 from psycopg import sql
-from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
+from geoagent.config import Settings
 from geoagent.db.connection import connect
 from geoagent.db.migrate import apply_migrations
 
-TEST_DATABASE_URL = os.environ.get(
-    "TEST_DATABASE_URL", "postgresql://<DB_USER>:<DB_PASSWORD>@localhost:5432/geoagent_test"
-)
 
-
-def recreate_database(url: str) -> None:
-    name = conninfo_to_dict(url)["dbname"]
-    with psycopg.connect(make_conninfo(url, dbname="postgres"), autocommit=True) as admin:
+def recreate_database(settings: Settings, name: str) -> None:
+    with connect(settings, dbname="postgres", register_vector_type=False) as admin:
         admin.execute(
             sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name))
         )
@@ -527,16 +708,23 @@ def recreate_database(url: str) -> None:
 
 
 @pytest.fixture(scope="session")
-def test_database_url() -> str:
-    recreate_database(TEST_DATABASE_URL)
-    with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as conn:
-        apply_migrations(conn)
-    return TEST_DATABASE_URL
+def settings() -> Settings:
+    """Credentials come from the repo `.env` (the same file docker compose reads)."""
+    return Settings()
+
+
+@pytest.fixture(scope="session")
+def test_db(settings: Settings) -> str:
+    name = f"{settings.db_name}_test"
+    recreate_database(settings, name)
+    with connect(settings, dbname=name, register_vector_type=False) as c:
+        apply_migrations(c)
+    return name
 
 
 @pytest.fixture
-def conn(test_database_url: str) -> Iterator[psycopg.Connection]:
-    c = connect(test_database_url)
+def conn(settings: Settings, test_db: str) -> Iterator[psycopg.Connection]:
+    c = connect(settings, dbname=test_db)
     c.execute("TRUNCATE chunks, documents, workspaces CASCADE")
     yield c
     c.close()
@@ -551,20 +739,20 @@ import uuid
 
 import psycopg
 import pytest
-from psycopg.conninfo import make_conninfo
 
+from geoagent.db.connection import connect
 from geoagent.db.migrate import apply_migrations
-from tests.integration.conftest import TEST_DATABASE_URL, recreate_database
+from tests.integration.conftest import recreate_database
 
 pytestmark = pytest.mark.integration
 
-MIGRATION_DB_URL = make_conninfo(TEST_DATABASE_URL, dbname="geoagent_migration_test")
+MIGRATION_DB = "geoagent_migration_test"
 
 
 @pytest.fixture
-def fresh() -> psycopg.Connection:
-    recreate_database(MIGRATION_DB_URL)
-    with psycopg.connect(MIGRATION_DB_URL, autocommit=True) as c:
+def fresh(settings) -> psycopg.Connection:
+    recreate_database(settings, MIGRATION_DB)
+    with connect(settings, dbname=MIGRATION_DB, register_vector_type=False) as c:
         yield c
 
 
@@ -591,46 +779,87 @@ def test_hnsw_cosine_index_exists(fresh):
     assert "hnsw" in row[0] and "vector_cosine_ops" in row[0]
 
 
+def make_workspace(conn, slug: str = "ws") -> uuid.UUID:
+    workspace_id = uuid.uuid4()
+    conn.execute(
+        "INSERT INTO workspaces (id, slug, name) VALUES (%s, %s, %s)",
+        (workspace_id, slug, slug.upper()),
+    )
+    return workspace_id
+
+
+def make_document(conn, workspace_id, *, sha: str = "h", status: str = "ready") -> uuid.UUID:
+    document_id = uuid.uuid4()
+    conn.execute(
+        "INSERT INTO documents (id, workspace_id, title, blob_uri, sha256, status) "
+        "VALUES (%s, %s, 't', 'local://b/k', %s, %s)",
+        (document_id, workspace_id, sha, status),
+    )
+    return document_id
+
+
+def make_chunk(conn, document_id, workspace_id) -> None:
+    conn.execute(
+        "INSERT INTO chunks (id, document_id, workspace_id, ordinal, page_start, page_end, "
+        "text, token_count, embedding) "
+        "VALUES (%s, %s, %s, 0, 1, 1, 'x', 1, array_fill(0.1, ARRAY[768])::vector)",
+        (uuid.uuid4(), document_id, workspace_id),
+    )
+
+
 def test_status_check_constraint(fresh):
     apply_migrations(fresh)
-    fresh.execute("INSERT INTO workspaces (id, name) VALUES ('ws', 'WS')")
+    ws = make_workspace(fresh)
     with pytest.raises(psycopg.errors.CheckViolation):
-        fresh.execute(
-            "INSERT INTO documents (id, workspace_id, title, blob_uri, sha256, status) "
-            "VALUES (%s, 'ws', 't', 'local://b/k', 'abc', 'bogus')",
-            (uuid.uuid4(),),
-        )
+        make_document(fresh, ws, status="bogus")
 
 
-def test_sha256_unique_per_workspace(fresh):
+def test_sha256_unique_per_workspace_only(fresh):
     apply_migrations(fresh)
-    fresh.execute("INSERT INTO workspaces (id, name) VALUES ('ws', 'WS')")
-    insert = (
-        "INSERT INTO documents (id, workspace_id, title, blob_uri, sha256, status) "
-        "VALUES (%s, 'ws', 't', 'local://b/k', 'same', 'uploaded')"
-    )
-    fresh.execute(insert, (uuid.uuid4(),))
+    ws_a, ws_b = make_workspace(fresh, "ws-a"), make_workspace(fresh, "ws-b")
+    make_document(fresh, ws_a, sha="same")
+    make_document(fresh, ws_b, sha="same")  # same PDF in another tenant is allowed
     with pytest.raises(psycopg.errors.UniqueViolation):
-        fresh.execute(insert, (uuid.uuid4(),))
+        make_document(fresh, ws_a, sha="same")
 
 
 def test_deleting_document_cascades_to_chunks(fresh):
     apply_migrations(fresh)
-    doc_id = uuid.uuid4()
-    fresh.execute("INSERT INTO workspaces (id, name) VALUES ('ws', 'WS')")
-    fresh.execute(
-        "INSERT INTO documents (id, workspace_id, title, blob_uri, sha256, status) "
-        "VALUES (%s, 'ws', 't', 'local://b/k', 'h', 'ready')",
-        (doc_id,),
-    )
-    fresh.execute(
-        "INSERT INTO chunks (id, document_id, workspace_id, ordinal, page_start, page_end, "
-        "text, token_count, embedding) "
-        "VALUES (%s, %s, 'ws', 0, 1, 1, 'x', 1, array_fill(0.1, ARRAY[768])::vector)",
-        (uuid.uuid4(), doc_id),
-    )
-    fresh.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
+    ws = make_workspace(fresh)
+    doc = make_document(fresh, ws)
+    make_chunk(fresh, doc, ws)
+    fresh.execute("DELETE FROM documents WHERE id = %s", (doc,))
     assert fresh.execute("SELECT count(*) FROM chunks").fetchone() == (0,)
+
+
+def test_chunk_cannot_belong_to_another_tenant_than_its_document(fresh):
+    apply_migrations(fresh)
+    ws_a, ws_b = make_workspace(fresh, "ws-a"), make_workspace(fresh, "ws-b")
+    doc_a = make_document(fresh, ws_a)
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        make_chunk(fresh, doc_a, ws_b)
+
+
+def test_workspace_with_documents_cannot_be_deleted(fresh):
+    apply_migrations(fresh)
+    ws = make_workspace(fresh)
+    make_document(fresh, ws)
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        fresh.execute("DELETE FROM workspaces WHERE id = %s", (ws,))
+
+
+def test_workspace_slug_is_unique(fresh):
+    apply_migrations(fresh)
+    make_workspace(fresh, "tenant-a")
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        make_workspace(fresh, "tenant-a")
+
+
+@pytest.mark.parametrize("bad_slug", ["Tenant A", "a", "-leading-dash", "under_score"])
+def test_workspace_slug_format_is_enforced(fresh, bad_slug):
+    apply_migrations(fresh)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        make_workspace(fresh, bad_slug)
 ```
 
 - [ ] **Step 5: Run to verify failure**
@@ -638,17 +867,82 @@ def test_deleting_document_cascades_to_chunks(fresh):
 Run: `uv run pytest tests/integration/test_migrations.py -q`
 Expected: FAIL — `apply_migrations` returns `[]` (no SQL file yet) and table lookups raise `UndefinedTable`.
 
-- [ ] **Step 6 [DEVELOPER]: Write `geoagent/db/migrations/001_init.sql`**
+- [ ] **Step 6: Write `geoagent/db/migrations/001_init.sql`** (exactly the contract SQL above)
 
-Write it yourself from the contract above and spec §6. Things to understand while writing:
+Things to understand (developer review):
 - `vector(768)` fixes dimensionality at the type level — inserting a 767-dim vector fails. Why 768 and not 3072? (pgvector HNSW limit: 2,000 dims for `vector`.)
 - `vector_cosine_ops` must match the operator used at query time (`<=>`), otherwise the index is ignored.
-- Why is `workspace_id` duplicated on `chunks` when it is derivable via `documents`?
+- Why is `workspace_id` duplicated on `chunks` when it is derivable via `documents`, and how does the composite foreign key make that safe?
+- Why a UUID primary key plus a `slug`, instead of the slug as the key?
 
 - [ ] **Step 7: Run to verify pass**
 
 Run: `uv run pytest tests/integration/test_migrations.py -q`
-Expected: `6 passed`.
+Expected: `13 passed`.
+
+- [ ] **Step 7b [LLM]: Workspace helpers (resolve slug ↔ UUID at the edges)**
+
+`tests/integration/test_workspaces.py`:
+
+```python
+import uuid
+
+import psycopg
+import pytest
+
+from geoagent.db.workspaces import WorkspaceNotFound, create_workspace, get_workspace_id
+
+pytestmark = pytest.mark.integration
+
+
+def test_create_then_resolve_by_slug(conn):
+    workspace_id = create_workspace(conn, slug="tenant-a", name="Tenant A")
+    assert isinstance(workspace_id, uuid.UUID)
+    assert get_workspace_id(conn, "tenant-a") == workspace_id
+
+
+def test_unknown_slug_raises(conn):
+    with pytest.raises(WorkspaceNotFound):
+        get_workspace_id(conn, "nobody")
+
+
+def test_duplicate_slug_is_rejected(conn):
+    create_workspace(conn, slug="tenant-a", name="Tenant A")
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        create_workspace(conn, slug="tenant-a", name="Again")
+```
+
+Run: `uv run pytest tests/integration/test_workspaces.py -q` → FAIL (`ModuleNotFoundError`).
+
+`geoagent/db/workspaces.py`:
+
+```python
+import uuid
+
+import psycopg
+
+
+class WorkspaceNotFound(LookupError):
+    """No workspace has this slug."""
+
+
+def create_workspace(conn: psycopg.Connection, *, slug: str, name: str) -> uuid.UUID:
+    workspace_id = uuid.uuid4()
+    conn.execute(
+        "INSERT INTO workspaces (id, slug, name) VALUES (%s, %s, %s)",
+        (workspace_id, slug, name),
+    )
+    return workspace_id
+
+
+def get_workspace_id(conn: psycopg.Connection, slug: str) -> uuid.UUID:
+    row = conn.execute("SELECT id FROM workspaces WHERE slug = %s", (slug,)).fetchone()
+    if row is None:
+        raise WorkspaceNotFound(slug)
+    return row[0]
+```
+
+Run: `uv run pytest tests/integration/test_workspaces.py -q` → `3 passed`.
 
 - [ ] **Step 8 [LLM]: Review questions for the developer**
 
@@ -657,8 +951,8 @@ Ask (do not answer): What happens to an HNSW index build time as rows grow? What
 - [ ] **Step 9: Commit**
 
 ```bash
-git add geoagent/db tests/integration/conftest.py tests/integration/test_migrations.py
-git commit -m "feat: add schema migration and runner"
+git add geoagent/db tests/unit/test_db_connection.py tests/integration/conftest.py tests/integration/test_migrations.py tests/integration/test_workspaces.py
+git commit -m "feat: add schema migration, runner, connection retries and workspace helpers"
 ```
 
 ---
@@ -1791,6 +2085,8 @@ git commit -m "feat: add section-aware, token-limited chunker"
 
 ## Task 12: Ingestion pipeline [Developer zone]
 
+> **Amendment — schema v2 (apply before executing this task):** `workspace_id` is a `uuid.UUID`, not a string. Contract step 1 ("ensure the workspace row exists") is **removed**: callers resolve or create the workspace first (`geoagent.db.workspaces`). In the tests, replace the `WS` constant with a fixture `ws` returning `create_workspace(conn, slug="test-ws", name="Test")`, and delete the assertion on `SELECT id FROM workspaces`. Blob keys use the UUID: `raw/{workspace_id}/{document_id}.pdf`, uploads under `incoming/{workspace_id}/`. **Review note (Task 4):** upsert the document with `INSERT ... ON CONFLICT (workspace_id, sha256) DO UPDATE ... RETURNING id` (also resolves two runners ingesting the same PDF); never UPDATE `documents.id`/`workspace_id` (composite FK target); write the `failed` status on the autocommit connection outside the chunk-insert transaction; set `updated_at = now()` explicitly (no trigger).
+
 **Files:**
 - Create (DEV): `geoagent/ingest/pipeline.py`
 - Test (LLM): `tests/integration/test_pipeline.py`
@@ -1954,6 +2250,8 @@ git commit -m "feat: add idempotent ingestion pipeline with status tracking"
 ---
 
 ## Task 13: Retriever [Developer zone]
+
+> **Amendment — schema v2 (apply before executing this task):** `workspace_id` is a `uuid.UUID`. `tests/integration/seed.py` gains `ensure_workspace(conn, slug) -> UUID` (get-or-create via `geoagent.db.workspaces`); `seed_chunk` takes `workspace_slug: str`, inserts the document/chunk with the resolved UUID and the new `workspaces(id, slug, name)` columns. The `seeded` fixture also returns `ws_a`/`ws_b` UUIDs; tests call `retrieve(..., workspace_id=seeded["ws_a"])`; the unknown-workspace test uses `uuid.uuid4()`. **Review note (Task 4) — HNSW + tenant filter:** with the default `hnsw.iterative_scan = off`, once a big tenant exists the planner may use HNSW, scan only `ef_search` (40) candidates, then post-filter → a small tenant gets fewer than k rows. Run the query inside `with conn.transaction():` after `SET LOCAL hnsw.iterative_scan = relaxed_order` (autocommit makes `SET LOCAL` outside a transaction a silent no-op); `relaxed_order` is only approximately ordered, so wrap it in an outer `ORDER BY distance`. Add an integration test with one big tenant (thousands of rows) and one small tenant (a handful) asserting the small tenant still gets `top_k` results. `retrieve()` does not look up workspaces (the API resolves the slug once).
 
 **Files:**
 - Create (DEV): `geoagent/rag/retriever.py`
@@ -2204,6 +2502,8 @@ git commit -m "feat: add grounded prompt builder and citation parser"
 
 ## Task 15: Answer orchestration [Developer zone]
 
+> **Amendment — schema v2 (apply before executing this task):** `workspace_id` is typed `uuid.UUID` (the unit tests use fakes, so any value works there).
+
 **Files:**
 - Create (DEV): `geoagent/rag/answer.py`
 - Test (LLM): `tests/unit/test_answer.py`
@@ -2344,6 +2644,8 @@ git commit -m "feat: add answer orchestration with not-found short-circuit"
 
 ## Task 16: Logging, wiring, API [LLM zone]
 
+> **Amendment — schema v2 (apply before executing this task):** The API takes the workspace **slug** at the edge and resolves it once with `get_workspace_id` (`AskRequest.workspace: str`, `GET /documents?workspace=`, form field `workspace` on upload). Add an exception handler `WorkspaceNotFound` → 404 `{"error": "workspace_not_found"}`. Upload key: `incoming/{workspace_uuid}/{uuid4}.pdf` — **never put the user's filename in the key** (Task 5 review: on Windows, names differing only by case or trailing dots/spaces collapse to one file; GCS keeps them distinct); keep the original filename as metadata in the response/log. `BlobNotFound` and `ValueError` from the blob store map to 404 / 422. Unit tests monkeypatch `main.get_workspace_id` (the connection is faked); the integration test seeds with `ensure_workspace`.
+
 **Files:**
 - Create: `geoagent/logs.py`, `geoagent/wiring.py`, `geoagent/api/schemas.py`, `geoagent/api/main.py`
 - Test: `tests/unit/test_logs.py`, `tests/unit/test_api.py`, `tests/integration/test_api_ask.py`
@@ -2376,6 +2678,7 @@ def test_json_formatter_includes_request_id_and_extras():
 `tests/unit/test_api.py`:
 
 ```python
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
@@ -2445,6 +2748,18 @@ def test_ask_error_mapping(client, monkeypatch, exc, status, code):
     assert resp.status_code == status
     body = resp.json()
     assert body["error"] == code and body["request_id"]
+
+
+def test_database_unavailable_returns_503_with_retry_after(client):
+    def database_down():
+        raise psycopg.OperationalError("connection to server at 10.0.0.5 failed")
+
+    client.app.dependency_overrides[main.get_conn] = database_down
+    resp = client.post("/ask", json={"workspace_id": "ws", "question": "Grade?"})
+    assert resp.status_code == 503
+    assert resp.headers["retry-after"] == "10"
+    assert resp.json()["error"] == "database_unavailable"
+    assert "10.0.0.5" not in resp.text
 
 
 def test_ask_validation_error(client):
@@ -2577,15 +2892,15 @@ from geoagent.providers.ollama import OllamaProvider
 from geoagent.providers.types import EmbeddingProvider, LLMProvider
 
 
-def open_connection() -> psycopg.Connection:
-    return connect(get_settings().database_url)
+def open_connection(*, statement_timeout_ms: int | None = None) -> psycopg.Connection:
+    return connect(get_settings(), statement_timeout_ms=statement_timeout_ms)
 
 
 @lru_cache
 def get_embedder() -> EmbeddingProvider:
     s = get_settings()
-    if s.gemini_api_key:
-        client = genai.Client(api_key=s.gemini_api_key)
+    if s.gemini_api_key is not None:
+        client = genai.Client(api_key=s.gemini_api_key.get_secret_value())
     else:
         client = genai.Client(
             vertexai=True, project=s.google_cloud_project, location=s.embedding_location
@@ -2741,6 +3056,20 @@ def create_app() -> FastAPI:
     async def on_provider_error(request: Request, exc: ProviderError):
         return _error(502, "provider_error", exc)
 
+    @app.exception_handler(psycopg.OperationalError)
+    async def on_database_unavailable(request: Request, exc: psycopg.OperationalError):
+        # Generic detail on purpose: driver messages reveal internal hosts and ports.
+        log.warning("database unavailable", extra={"error": type(exc).__name__})
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "10"},
+            content={
+                "error": "database_unavailable",
+                "detail": "database temporarily unavailable",
+                "request_id": request_id_var.get(),
+            },
+        )
+
     @app.get("/healthz")
     def healthz() -> dict:
         return {"status": "ok"}
@@ -2810,7 +3139,7 @@ app = create_app()
 - [ ] **Step 7: Run to verify pass**
 
 Run: `uv run pytest tests/unit/test_logs.py tests/unit/test_api.py -q`
-Expected: `10 passed`.
+Expected: `11 passed`.
 
 Run: `uv run pytest tests/integration/test_api_ask.py -q`
 Expected: `1 passed`.
@@ -2827,6 +3156,8 @@ git commit -m "feat: add FastAPI app, provider wiring and JSON logging"
 ---
 
 ## Task 17: CLI, smoke loader, report fetcher [LLM zone]
+
+> **Amendment — schema v2 (apply before executing this task):** `--workspace` takes a slug, resolved with `get_workspace_id` (clear error if unknown). Add a `workspace` sub-command group: `geoagent workspace create SLUG --name NAME` and `geoagent workspace list`.
 
 **Files:**
 - Create: `geoagent/smoke.py`, `geoagent/cli.py`, `scripts/fetch_reports.py`
@@ -2929,11 +3260,11 @@ def load_smoke(path: Path) -> list[SmokeItem]:
 from pathlib import Path
 from typing import Annotated
 
-import psycopg
 import typer
 
 from geoagent import wiring
 from geoagent.config import get_settings
+from geoagent.db.connection import connect
 from geoagent.db.migrate import apply_migrations
 from geoagent.ingest.pipeline import IngestResult, ingest_bytes, ingest_from_blob
 from geoagent.logs import configure_logging
@@ -2941,6 +3272,9 @@ from geoagent.rag.answer import AskResponse, answer_question
 from geoagent.smoke import load_smoke
 
 app = typer.Typer(help="GeoAgent command-line interface", no_args_is_help=True)
+
+# Batch work (migrations, bulk inserts) gets a longer statement timeout than API requests.
+BATCH_STATEMENT_TIMEOUT_MS = 120_000
 
 
 @app.callback()
@@ -2951,7 +3285,9 @@ def main() -> None:
 @app.command()
 def migrate() -> None:
     """Apply pending SQL migrations."""
-    with psycopg.connect(get_settings().database_url, autocommit=True) as conn:
+    with connect(
+        get_settings(), statement_timeout_ms=BATCH_STATEMENT_TIMEOUT_MS, register_vector_type=False
+    ) as conn:
         applied = apply_migrations(conn)
     typer.echo(f"applied: {', '.join(applied) if applied else 'nothing (up to date)'}")
 
@@ -2975,7 +3311,7 @@ def ingest(
         raise typer.BadParameter("give PDF paths and/or --from-blob PREFIX")
     blobs, embedder = wiring.get_blobstore(), wiring.get_embedder()
     results: list[IngestResult] = []
-    with wiring.open_connection() as conn:
+    with wiring.open_connection(statement_timeout_ms=BATCH_STATEMENT_TIMEOUT_MS) as conn:
         for path in paths or []:
             results.append(
                 ingest_bytes(conn, blobs, embedder, workspace_id=workspace,
@@ -3118,6 +3454,19 @@ Ollama runs **outside** Docker Compose, on any GPU machine on the LAN. The API r
 `OLLAMA_BASE_URL`. Ollama has **no authentication** — keep port 11434 on the LAN only, never
 expose it to the internet.
 
+## Windows + NVIDIA GPU (the MVP host)
+
+Install Ollama for Windows (https://ollama.com/download), then:
+
+```bash
+ollama pull qwen3:8b
+curl http://127.0.0.1:11434/api/tags
+```
+
+The compose `api` container reaches it at `http://host.docker.internal:11434`. If that request
+fails, Ollama is listening on loopback only: set the user environment variable
+`OLLAMA_HOST=0.0.0.0`, restart Ollama, and allow port 11434 on private networks only.
+
 ## Linux + AMD GPU (ROCm, RDNA4 needs the ROCm 7 driver)
 
 Podman (works on immutable/atomic distros without layering packages):
@@ -3194,13 +3543,13 @@ services:
     environment:
       POSTGRES_USER: ${DB_USER:?set DB_USER in .env}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
-      POSTGRES_DB: geoagent
+      POSTGRES_DB: ${DB_NAME:-geoagent}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -3209,8 +3558,9 @@ services:
     build: .
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://<DB_USER>:<DB_PASSWORD>@postgres:5432/geoagent
+      DB_HOST: postgres
       BLOB_ROOT: /app/blobdata
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
     volumes:
       - ./blobdata:/app/blobdata
     ports:
@@ -3225,9 +3575,9 @@ volumes:
 
 - [ ] **Step 4: Build and run**
 
-Prerequisite: `.env` created from `.env.example` with `GEMINI_API_KEY`, `OLLAMA_BASE_URL` and `LLM_MODEL` filled in; the GPU host answers the `curl` check from `docs/local-llm.md`.
+Prerequisite: `.env` has `DB_USER`, `DB_PASSWORD` and `GEMINI_API_KEY` filled in; Ollama answers the `curl` check from `docs/local-llm.md`.
 
-Run: `docker compose up -d --build` then `curl http://localhost:8080/healthz`
+Run: `docker compose up -d --build` then `curl http://127.0.0.1:8080/healthz`
 Expected: `{"status":"ok"}`.
 
 Run: `uv run geoagent migrate`
@@ -3244,6 +3594,8 @@ git commit -m "build: add Dockerfile, compose api service and local LLM host gui
 
 ## Task 19: Real data, smoke set and first experiments [Developer zone]
 
+> **Amendment — schema v2 (apply before executing this task):** First create the simulated tenants: `geoagent workspace create tenant-a --name "Tenant A"`, same for `tenant-b`, `tenant-c`. Ingest Waihi into `tenant-a` and Macraes into `tenant-b` (tenant-c gets a third public report later). Add an isolation check: a Macraes question asked as `tenant-a` must return the not-found answer.
+
 **Files:**
 - Create (DEV): `evals/smoke.jsonl`
 - Modify (DEV): `docs/learning-log.md`
@@ -3251,9 +3603,9 @@ git commit -m "build: add Dockerfile, compose api service and local LLM host gui
 - [ ] **Step 1: Ingest the real reports**
 
 Run: `uv run geoagent ingest --workspace nz-gold data/waihi-ni43-101.pdf data/macraes-ni43-101.pdf`
-Expected: two `ready` lines. Then `curl "http://localhost:8080/documents?workspace_id=nz-gold"` lists both with `page_count`.
+Expected: two `ready` lines. Then `curl "http://127.0.0.1:8080/documents?workspace_id=nz-gold"` lists both with `page_count`.
 
-Inspect: `docker compose exec postgres psql -U "$POSTGRES_USER" -c "SELECT d.title, count(*), avg(c.token_count)::int FROM chunks c JOIN documents d ON d.id = c.document_id GROUP BY 1"`.
+Inspect: `docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' -c "SELECT d.title, count(*), avg(c.token_count)::int FROM chunks c JOIN documents d ON d.id = c.document_id GROUP BY 1"`.
 
 - [ ] **Step 2: Ask a first question**
 
@@ -3290,6 +3642,8 @@ git commit -m "eval: add smoke set and first learning-log experiments"
 ---
 
 ## Task 20: Cross-environment embedding check [LLM zone]
+
+> **Status: superseded (2026-10-07).** The MVP no longer deploys to GCP. These tasks will be replaced by a cloud design document, local Terraform (Docker provider), and GCP Terraform that is validated but never applied. Kept for reference only; do not execute.
 
 Verifies the spec's core assumption: AI Studio and Vertex AI return the same vectors for `gemini-embedding-001`, so one index serves both.
 
@@ -3348,6 +3702,8 @@ git commit -m "chore: add AI Studio vs Vertex embedding comparison script"
 
 ## Task 21: Terraform bootstrap (state bucket) [Developer zone]
 
+> **Status: superseded (2026-10-07).** The MVP no longer deploys to GCP. These tasks will be replaced by a cloud design document, local Terraform (Docker provider), and GCP Terraform that is validated but never applied. Kept for reference only; do not execute.
+
 **Files:**
 - Create (DEV): `infra/terraform/bootstrap/main.tf`
 
@@ -3386,6 +3742,8 @@ git commit -m "infra: add terraform state bucket bootstrap"
 ---
 
 ## Task 22: Terraform main stack [scaffold: LLM zone; resources: Developer zone]
+
+> **Status: superseded (2026-10-07).** The MVP no longer deploys to GCP. These tasks will be replaced by a cloud design document, local Terraform (Docker provider), and GCP Terraform that is validated but never applied. Kept for reference only; do not execute.
 
 **Files:**
 - Create (LLM): `infra/terraform/main/versions.tf`, `variables.tf`, `locals.tf`, `outputs.tf`
@@ -3542,6 +3900,8 @@ git commit -m "infra: add main GCP stack (Cloud Run, Cloud SQL, GCS, Secret Mana
 ---
 
 ## Task 23: Deploy runbook, cloud run-through, destroy [runbook: LLM zone; execution: Developer]
+
+> **Status: superseded (2026-10-07).** The MVP no longer deploys to GCP. These tasks will be replaced by a cloud design document, local Terraform (Docker provider), and GCP Terraform that is validated but never applied. Kept for reference only; do not execute.
 
 **Files:**
 - Create: `docs/deploy.md`

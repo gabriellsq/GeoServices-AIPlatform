@@ -119,14 +119,18 @@ GeoSolution/
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- Tenant. UUID primary key (meaningless, immutable); slug is the human-readable handle.
 CREATE TABLE workspaces (
-    id   TEXT PRIMARY KEY,
-    name TEXT NOT NULL
+    id         UUID PRIMARY KEY,
+    slug       TEXT NOT NULL UNIQUE CHECK (slug ~ '^[a-z0-9][a-z0-9-]{1,62}$'),
+    name       TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- One row per source PDF. No ON DELETE on the workspace FK: tenant offboarding is explicit.
 CREATE TABLE documents (
     id           UUID PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id),
     title        TEXT NOT NULL,
     source_url   TEXT,
     blob_uri     TEXT NOT NULL,
@@ -136,13 +140,16 @@ CREATE TABLE documents (
     page_count   INT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (workspace_id, sha256)
+    UNIQUE (workspace_id, sha256),
+    UNIQUE (id, workspace_id)            -- target of the composite FK below
 );
 
+-- One row per chunk. workspace_id is denormalised for filtering; the composite FK
+-- guarantees it always equals the parent document's workspace.
 CREATE TABLE chunks (
     id           UUID PRIMARY KEY,
-    document_id  UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    workspace_id TEXT NOT NULL,
+    document_id  UUID NOT NULL,
+    workspace_id UUID NOT NULL,
     ordinal      INT  NOT NULL,
     page_start   INT  NOT NULL,
     page_end     INT  NOT NULL,
@@ -150,7 +157,9 @@ CREATE TABLE chunks (
     text         TEXT NOT NULL,
     token_count  INT  NOT NULL,
     embedding    vector(768) NOT NULL,
-    UNIQUE (document_id, ordinal)
+    UNIQUE (document_id, ordinal),
+    FOREIGN KEY (document_id, workspace_id)
+        REFERENCES documents (id, workspace_id) ON DELETE CASCADE
 );
 
 CREATE INDEX chunks_embedding_hnsw ON chunks USING hnsw (embedding vector_cosine_ops);
@@ -158,9 +167,12 @@ CREATE INDEX chunks_workspace ON chunks (workspace_id);
 ```
 
 Notes:
-- `workspace_id` is denormalised onto `chunks` so vector search filters without a join. It is the tenant boundary; in Sprint 1 it is passed by the client, in the security sprint it comes from the authenticated identity and is enforced with RLS.
-- 768 dimensions: pgvector's HNSW on `vector` supports at most 2,000 dimensions, so the 3,072-dim default output is reduced via `output_dimensionality=768`. Truncated Gemini embeddings must be **L2-normalised** before storage and before querying.
+- **Primary keys are meaningless and immutable.** `workspaces.id` is a UUID; `slug` (e.g. `tenant-a`) is what humans and CLIs use, resolved to the UUID at the edge (API/CLI). Renaming a tenant changes one column, never a key or a blob path.
+- `workspace_id` is denormalised onto `chunks` so vector search filters without a join. The **composite foreign key** `(document_id, workspace_id) → documents(id, workspace_id)` makes it impossible for a chunk to carry a different tenant than its document. In Sprint 1 the client passes the workspace slug; in the security sprint the tenant comes from the authenticated identity and is also enforced with RLS.
+- `documents.workspace_id` has no `ON DELETE`: a workspace with documents cannot be deleted by accident.
+- 768 dimensions: pgvector's HNSW on `vector` supports at most 2,000 dimensions, so the 3,072-dim default output is reduced via `output_dimensionality=768` (Matryoshka truncation). Truncated Gemini embeddings must be **L2-normalised** before storage and before querying.
 - `sha256` uniqueness per workspace prevents duplicate ingestion.
+- Three simulated tenants (`tenant-a`, `tenant-b`, `tenant-c`) exercise isolation.
 
 ## 7. Data flows
 
