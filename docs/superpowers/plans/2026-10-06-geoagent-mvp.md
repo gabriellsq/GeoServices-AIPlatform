@@ -2644,7 +2644,7 @@ git commit -m "feat: add answer orchestration with not-found short-circuit"
 
 ## Task 16: Logging, wiring, API [LLM zone]
 
-> **Amendment — schema v2 (apply before executing this task):** The API takes the workspace **slug** at the edge and resolves it once with `get_workspace_id` (`AskRequest.workspace: str`, `GET /documents?workspace=`, form field `workspace` on upload). Add an exception handler `WorkspaceNotFound` → 404 `{"error": "workspace_not_found"}`. Upload key: `incoming/{workspace_uuid}/{name}`. Unit tests monkeypatch `main.get_workspace_id` (the connection is faked); the integration test seeds with `ensure_workspace`.
+> **Amendment — schema v2 (apply before executing this task):** The API takes the workspace **slug** at the edge and resolves it once with `get_workspace_id` (`AskRequest.workspace: str`, `GET /documents?workspace=`, form field `workspace` on upload). Add an exception handler `WorkspaceNotFound` → 404 `{"error": "workspace_not_found"}`. Upload key: `incoming/{workspace_uuid}/{uuid4}.pdf` — **never put the user's filename in the key** (Task 5 review: on Windows, names differing only by case or trailing dots/spaces collapse to one file; GCS keeps them distinct); keep the original filename as metadata in the response/log. `BlobNotFound` and `ValueError` from the blob store map to 404 / 422. Unit tests monkeypatch `main.get_workspace_id` (the connection is faked); the integration test seeds with `ensure_workspace`.
 
 **Files:**
 - Create: `geoagent/logs.py`, `geoagent/wiring.py`, `geoagent/api/schemas.py`, `geoagent/api/main.py`
