@@ -229,3 +229,40 @@ User ─► Identity Platform / IAP (token: tenant_id, user_id, roles)
 - Read SQL files as `utf-8-sig` (Windows editors add a BOM → `syntax error at or near "\ufeff"`).
 - Pin extension images (`pgvector/pgvector:0.8.7-pg16`, not `:pg16`) so behaviour you rely on (iterative index scans need ≥ 0.8) cannot silently change.
 - Test databases: refuse to run destructive test setup (`DROP DATABASE`) unless the host is local.
+
+---
+
+## 7. Embeddings as data (data-engineering view) + ACID
+
+- **HNSW** = Hierarchical Navigable Small World: a layered graph; search enters at a sparse top layer and descends toward the nearest neighbours. Approximate, fast, memory-hungry. It is an *index*, not a storage design.
+- **Embeddings are derived data**, not source data:
+  ```
+  BRONZE raw PDFs (blob)  →  SILVER pages/chunks (text + metadata)  →  GOLD embeddings + index (rebuildable)
+  ```
+- Store **full fidelity once**, derive cheap forms (768-dim truncation, binary quantization) like views.
+- Record **lineage on every vector**: `embedding_model`, `model_version`, `dims`, `task_type`, `normalized`. Vectors from different models live in different spaces — never mix them in one index.
+- **Model change = backfill + index swap** (blue/green): re-embed into a new column/table → build index → switch reads → drop old. Never half-update in place.
+- **Serving ≠ analytics:** Postgres/pgvector for low-latency per-tenant top-k (OLTP); export embeddings to **BigQuery/Parquet** for clustering, dedup, drift and topic analysis (`VECTOR_SEARCH`, `ML.GENERATE_EMBEDDING`) — that is the "embedding data mart".
+- Truncated vector in Postgres — options:
+
+  | Option | Verdict |
+  |---|---|
+  | Expression index on `subvector(embedding_full,1,768)` + rerank with full vector | Best: always consistent, no refresh |
+  | Generated stored column + index | Consistent, costs storage (functions must be immutable) |
+  | Materialized view + index | Stale until `REFRESH`; fine for analytics snapshots, wrong for serving |
+  | Plain view | Cannot be ANN-indexed |
+
+- This MVP stores only 768 dims (API truncates) → simpler, but going back to 3072 needs re-embedding. Experiment idea: `halfvec(3072)` + 768-dim expression index, compare recall.
+- **HNSW operations:** build the index *after* bulk loads (much faster; raise `maintenance_work_mem`); tune `m`/`ef_construction` (build) and `hnsw.ef_search` (query recall vs latency); updates/deletes leave dead graph entries until `VACUUM` → bloat and recall loss → periodic `REINDEX` under churn.
+
+### ACID still matters
+| | In this project |
+|---|---|
+| Atomicity | Replace chunks + set `ready` in one transaction — never `ready` with half the chunks |
+| Consistency | Composite FK, `vector(768)`, CHECKs always enforced — a chunk can never point at another tenant's document |
+| Isolation | MVCC: a query during re-ingestion sees all old or all new chunks |
+| Durability | HNSW index is WAL-logged; survives crashes with the rows |
+
+- ACID guarantees the **state** is correct; **ANN results are still approximate**. Consistency ≠ exact nearest neighbours — it means never returning a deleted or foreign chunk.
+- Dedicated vector DBs often trade this away: write-to-searchable freshness lag, tunable consistency levels (e.g. Strong/Bounded/Session/Eventually), no transactions spanning your metadata store.
+- ACID matters most for **deletions, permissions, re-ingestion, model swaps**; eventual consistency is acceptable for an append-only public corpus.
