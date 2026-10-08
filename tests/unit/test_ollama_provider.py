@@ -97,3 +97,68 @@ def test_model_not_pulled_is_a_provider_error_with_message():
         make(lambda r: resp).generate("s", "p")
     assert not isinstance(info.value, ProviderUnavailable)
     assert "not found" in str(info.value)
+
+
+def test_sends_num_ctx_and_split_timeouts():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        seen["timeout"] = request.extensions["timeout"]
+        return httpx.Response(200, json=ok_body())
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    OllamaProvider(base_url="http://h:11434", model="m", timeout_s=60, client=client).generate("s", "p")
+    assert seen["body"]["options"] == {"temperature": 0, "num_ctx": 8192}
+    assert seen["timeout"]["connect"] == 5.0
+    assert seen["timeout"]["read"] == 60
+
+
+def test_num_ctx_can_be_disabled():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=ok_body())
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    OllamaProvider(base_url="http://h", model="m", num_ctx=None, client=client).generate("s", "p")
+    assert seen["body"]["options"] == {"temperature": 0}
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, text="<html>proxy page</html>"),
+        httpx.Response(200, json={"error": "something odd"}),
+        httpx.Response(200, json={"model": "m"}),
+        httpx.Response(200, json=[1, 2, 3]),
+    ],
+)
+def test_malformed_success_body_is_a_provider_error(response):
+    with pytest.raises(ProviderError) as info:
+        make(lambda r: response).generate("s", "p")
+    assert not isinstance(info.value, ProviderUnavailable)
+
+
+def test_truncated_generation_is_an_error():
+    body = ok_body("partial answer")
+    body["done_reason"] = "length"
+    with pytest.raises(ProviderError, match="truncated"):
+        make(lambda r: httpx.Response(200, json=body)).generate("s", "p")
+
+
+def test_long_error_bodies_are_truncated():
+    resp = httpx.Response(502, text="x" * 5000)
+    with pytest.raises(ProviderUnavailable) as info:
+        make(lambda r: resp).generate("s", "p")
+    assert len(str(info.value)) < 500
+
+
+def test_close_only_closes_owned_client():
+    injected = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=ok_body())))
+    OllamaProvider(base_url="http://h", model="m", client=injected).close()
+    assert not injected.is_closed
+    owned = OllamaProvider(base_url="http://h", model="m")
+    owned.close()
+    assert owned._client.is_closed
