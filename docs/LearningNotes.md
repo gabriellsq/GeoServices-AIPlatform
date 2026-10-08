@@ -319,7 +319,7 @@ Vector DBs store payloads too (Qdrant JSON, Pinecone metadata, Weaviate objects)
 ```
                      ┌──────────────── Terraform creates everything in this frame ────────────────┐
 WRITE (async)        │                                                                             │
-Sources ─► GCS raw/ ─► Eventarc/Pub/Sub ─► Cloud Run Job: parse → chunk → embed ─► Cloud SQL/AlloyDB
+Sources ─► GCS raw/ ─► Eventarc ─► Workflows ─► Cloud Run Job: parse → chunk → embed ─► Cloud SQL/AlloyDB
 READ (sync)          │                                                              (pgvector)     │
 User ─► LB + Cloud Armor ─► Identity ─► Cloud Run API ─► embed query (Vertex)           ▲          │
                      │                        ├─ top-k, tenant-filtered ────────────────┘          │
@@ -351,3 +351,47 @@ User ─► LB + Cloud Armor ─► Identity ─► Cloud Run API ─► embed q
 Fuse rankings with **RRF**: `score = Σ 1/(60 + rank_i)` over the dense and sparse lists (two CTEs + `FULL OUTER JOIN` in Postgres).
 
 **Terraform** is the frame, not a box: project/APIs, network, DB, buckets, topics, triggers, Cloud Run service/job definitions, service accounts/IAM, secret containers, registry, alerts, budgets. Not: image versions (CI by digest), data/vectors, model weights, secret values. Flow: PR → plan → review → apply (dev auto, prod with approval) via Workload Identity Federation.
+
+---
+
+## 10. Events, LLM integration, monitoring, payloads
+
+### Eventarc
+- Managed **event router** (GA 2021), not a load balancer. Transport is Pub/Sub under the hood; events use the CloudEvents format.
+- Before: GCS notification → Pub/Sub topic → push subscription → service (you wire topic, subscription, push auth, IAM, retries). Eventarc: one trigger resource ("on `storage.object.finalized` in bucket X → service Y").
+- Adds: filtering, CloudEvents, 100+ sources via Cloud Audit Logs (table created, IAM changed, document written).
+- Targets: Cloud Run **services**, functions, GKE, **Workflows** — **not Cloud Run Jobs directly** → GCS → Eventarc → Workflows → Job.
+- Cost: negligible for Google-source events at this scale (check current pricing).
+
+### The LLM never touches the database
+- LLMs are stateless: text in, text out. **The API orchestrates:** embed question → SQL top-k → build prompt text → LLM → parse citations. We write that integration (retriever, prompt, answer).
+- Managed alternatives: Vertex AI RAG Engine, grounding with Vertex AI Search, agents with tools (model *requests* a tool; your code runs it).
+
+### Non-Google models
+| Option | Billing |
+|---|---|
+| Partner models on Vertex AI Model Garden (Anthropic Claude, Llama, Mistral…) as managed APIs | Per token on the GCP bill |
+| Open models self-hosted (Vertex endpoint with GPUs, Cloud Run GPU, GKE + vLLM) | Per GPU-hour, even idle |
+| Direct third-party APIs from Cloud Run (key in Secret Manager) | Vendor bill; check data residency |
+- Swapping the **LLM** = config change behind `LLMProvider`. Swapping the **embedding model** = re-embed everything → choose embeddings carefully, LLMs freely.
+
+### BigQuery vector search ≠ pgvector
+- BigQuery has native `CREATE VECTOR INDEX` (IVF / TreeAH), `VECTOR_SEARCH()`, `ML.GENERATE_EMBEDDING()`.
+- Seconds of latency, priced by bytes/slots → batch & analytical semantic search (dedup, clustering, recommendations). Postgres/pgvector → per-request serving in ms.
+- BigQuery can read Cloud SQL via federated `EXTERNAL_QUERY`.
+
+### Monitoring layers
+| Layer | Signals | GCP |
+|---|---|---|
+| Infrastructure | requests, p50/p95/p99, 5xx, instances, cold starts; DB CPU/connections/disk | Cloud Monitoring (automatic) |
+| Logs | structured JSON: request_id, tenant, model, prompt_version | Cloud Logging, log-based metrics |
+| Traces | embed → retrieve → generate spans | OpenTelemetry → Cloud Trace |
+| LLM quality & cost | tokens, cost per request/tenant, retrieval scores, not-found rate, invalid citations, feedback, offline evals, sampled LLM-judge | Log sink → BigQuery → dashboards |
+Plus alerts/SLOs: p95 latency, 5xx rate, DB down, budget, burn rate.
+
+### Payloads (what the LLM actually sees)
+- Client → API: `{"workspace": "tenant-b", "question": "...", "top_k": 8}`
+- API → Gemini `generateContent`: `systemInstruction` (rules) + one user message containing numbered sources `[n] title | pages | section` + chunk text + the question; `generationConfig.maxOutputTokens`.
+- Gemini → API: `candidates[0].content.parts[0].text` + `usageMetadata` (prompt, candidates, thoughts tokens — thinking tokens are billed as output).
+- API → client: answer, found, citations (n, title, pages, section, snippet), model, prompt_version, latency_ms, tokens.
+- Other providers (e.g. Claude on Vertex) use a different body (`system`, `messages`, `max_tokens`) — translated inside the provider adapter.
