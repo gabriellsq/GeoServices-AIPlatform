@@ -9,7 +9,7 @@ from google.genai import types
 from geoagent.providers.errors import ProviderError, ProviderTimeout, ProviderUnavailable
 from geoagent.providers.types import Generation, TaskType
 
-RETRYABLE_CODES = {429, 500, 502, 503, 504}
+RETRYABLE_CODES = {408, 429, 500, 502, 503, 504}
 
 
 def _status_code(exc: Exception) -> int | None:
@@ -22,6 +22,22 @@ def l2_normalize(vector: list[float]) -> list[float]:
     if norm == 0:
         raise ProviderError("embedding has zero norm")
     return [x / norm for x in vector]
+
+
+_COMPLETE_FINISH_REASONS = {None, "STOP", "FINISH_REASON_UNSPECIFIED"}
+
+
+def _check_complete(resp: Any) -> None:
+    """Fail loudly on blocked, empty or truncated generations instead of returning partial text."""
+    candidates = getattr(resp, "candidates", None)
+    if not candidates:
+        feedback = getattr(resp, "prompt_feedback", None)
+        block = getattr(getattr(feedback, "block_reason", None), "name", None)
+        raise ProviderError(f"Gemini returned no candidates (block_reason={block})")
+    reason = getattr(candidates[0], "finish_reason", None)
+    reason = getattr(reason, "name", reason)
+    if reason not in _COMPLETE_FINISH_REASONS:
+        raise ProviderError(f"Gemini generation incomplete (finish_reason={reason})")
 
 
 class GeminiEmbeddings:
@@ -61,19 +77,17 @@ class GeminiEmbeddings:
                 result = self.client.models.embed_content(
                     model=self.model, contents=batch, config=config
                 )
-            except httpx.TimeoutException as exc:
-                raise ProviderTimeout(f"embedding request timed out: {exc}") from exc
-            except httpx.TransportError as exc:
-                raise ProviderUnavailable(f"embedding service unreachable: {exc}") from exc
             except Exception as exc:
-                code = _status_code(exc)
-                if code in RETRYABLE_CODES and attempt < self.max_retries:
+                transient = isinstance(exc, httpx.TransportError) or _status_code(exc) in RETRYABLE_CODES
+                if transient and attempt < self.max_retries:
                     self.sleep(min(2**attempt, 30))
                     continue
-                if code in RETRYABLE_CODES:
+                if isinstance(exc, httpx.TimeoutException):
+                    raise ProviderTimeout(f"embedding request timed out: {exc}") from exc
+                if transient:
                     raise ProviderUnavailable(f"embedding failed after retries: {exc}") from exc
                 raise ProviderError(f"embedding failed: {exc}") from exc
-            values = [list(e.values) for e in result.embeddings]
+            values = [list(e.values or []) for e in (result.embeddings or [])]
             if len(values) != len(batch):
                 raise ProviderError(f"expected {len(batch)} embeddings, got {len(values)}")
             for v in values:
@@ -104,6 +118,10 @@ class VertexGeminiProvider:
             if _status_code(exc) in RETRYABLE_CODES:
                 raise ProviderUnavailable(f"Gemini unavailable: {exc}") from exc
             raise ProviderError(f"Gemini request failed: {exc}") from exc
+        _check_complete(resp)
+        text = resp.text or ""
+        if not text.strip():
+            raise ProviderError("Gemini returned an empty answer")
         usage = resp.usage_metadata
         tokens_in = (getattr(usage, "prompt_token_count", None) or 0) if usage else 0
         tokens_out = (
@@ -113,5 +131,5 @@ class VertexGeminiProvider:
             else 0
         )
         return Generation(
-            text=resp.text or "", model=self.model, tokens_in=tokens_in, tokens_out=tokens_out
+            text=text, model=self.model, tokens_in=tokens_in, tokens_out=tokens_out
         )
