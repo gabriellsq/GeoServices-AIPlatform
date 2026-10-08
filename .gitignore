@@ -21,3 +21,6 @@ __pycache__/
 
 # Local blob store
 blobdata/
+
+# Agent worktrees / local tool state
+.claude/

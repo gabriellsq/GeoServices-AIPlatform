@@ -2644,6 +2644,8 @@ git commit -m "feat: add answer orchestration with not-found short-circuit"
 
 ## Task 16: Logging, wiring, API [LLM zone]
 
+> **Amendment — provider wiring (Task 7/8 reviews):** `OllamaProvider(..., num_ctx=...)` — pass all args by keyword; add setting `llm_num_ctx: int = 8192`. google-genai has **no timeout by default** (`timeout=None`): build **both** the embedding and the generation clients with `types.HttpOptions(timeout=<ms>)`. Do **not** set SDK `retry_options` on the embedding client (`GeminiEmbeddings` retries itself; stacking multiplies waits); generation may use modest SDK retries (e.g. 3 attempts) or none. Close the Ollama provider's client on app shutdown (FastAPI lifespan).
+
 > **Amendment — schema v2 (apply before executing this task):** The API takes the workspace **slug** at the edge and resolves it once with `get_workspace_id` (`AskRequest.workspace: str`, `GET /documents?workspace=`, form field `workspace` on upload). Add an exception handler `WorkspaceNotFound` → 404 `{"error": "workspace_not_found"}`. Upload key: `incoming/{workspace_uuid}/{uuid4}.pdf` — **never put the user's filename in the key** (Task 5 review: on Windows, names differing only by case or trailing dots/spaces collapse to one file; GCS keeps them distinct); keep the original filename as metadata in the response/log. `BlobNotFound` and `ValueError` from the blob store map to 404 / 422. Unit tests monkeypatch `main.get_workspace_id` (the connection is faked); the integration test seeds with `ensure_workspace`.
 
 **Files:**
