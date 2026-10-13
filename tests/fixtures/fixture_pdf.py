@@ -9,6 +9,8 @@ TABLE_ROWS = [
     ["DH-001", "45.0", "52.0", "3.10"],
     ["DH-002", "112.0", "118.5", "4.70"],
 ]
+TABLE_CAPTION = "Table 7-1: Significant drill intercepts"
+TABLE_NOTES = "Notes: intervals are downhole lengths; grades are uncut."
 
 
 def _pages(variant: str) -> list[list[str]]:
@@ -44,13 +46,15 @@ def _pages(variant: str) -> list[list[str]]:
     ]
 
 
-def _draw_table(page: pymupdf.Page, x: float, y: float) -> None:
+def _draw_table(page: pymupdf.Page, x: float, y: float) -> float:
+    """Draw the ruled table with its top-left corner at (x, y); return its bottom y."""
     col_w, row_h = 110.0, 18.0
     for r, row in enumerate(TABLE_ROWS):
         for c, cell in enumerate(row):
             rect = pymupdf.Rect(x + c * col_w, y + r * row_h, x + (c + 1) * col_w, y + (r + 1) * row_h)
             page.draw_rect(rect, color=(0, 0, 0), width=0.5)
             page.insert_text((rect.x0 + 3, rect.y1 - 5), cell, fontsize=9)
+    return y + len(TABLE_ROWS) * row_h
 
 
 def build_fixture_pdf(variant: str = "a") -> bytes:
@@ -64,7 +68,10 @@ def build_fixture_pdf(variant: str = "a") -> bytes:
             page.insert_text((50, y), line, fontsize=10)
             y += 16
         if number == 3:
-            _draw_table(page, 50, y + 10)
+            # Mirrors real reports: bold caption above, small-font notes below the table.
+            page.insert_text((50, y + 10), TABLE_CAPTION, fontsize=10, fontname="hebo")
+            bottom = _draw_table(page, 50, y + 20)
+            page.insert_text((50, bottom + 14), TABLE_NOTES, fontsize=8)
         page.insert_text((260, 815), f"Page {number} of {len(pages)}", fontsize=9)
     data = doc.tobytes(no_new_id=True)  # no random trailer /ID: same input -> same bytes -> same sha256
     doc.close()

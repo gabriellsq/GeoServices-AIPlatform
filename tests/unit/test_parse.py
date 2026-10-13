@@ -1,0 +1,261 @@
+import logging
+
+import pymupdf
+import pytest
+
+from geoagent.ingest.parse import (
+    GridCell,
+    Line,
+    Page,
+    Table,
+    body_font_size,
+    find_caption,
+    find_notes,
+    page_label,
+    parse_pdf,
+    reconstruct_table,
+)
+from tests.fixtures.fixture_pdf import HEADER, TABLE_CAPTION, TABLE_NOTES, build_fixture_pdf
+
+
+@pytest.fixture(scope="module")
+def pages() -> list[Page]:
+    return parse_pdf(build_fixture_pdf())
+
+
+def test_one_page_object_per_pdf_page_numbered_from_one(pages):
+    assert [p.number for p in pages] == [1, 2, 3, 4]
+
+
+def test_label_is_the_printed_page_number(pages):
+    assert [p.label for p in pages] == ["1", "2", "3", "4"]
+
+
+def test_prose_keeps_body_header_and_footer(pages):
+    # Header/footer stripping is the chunker's job; the parser extracts faithfully.
+    assert "1 SUMMARY" in pages[0].text
+    assert HEADER in pages[1].text
+    assert "Page 3 of 4" in pages[2].text
+    assert "Significant intercepts are listed in the table below." in pages[2].text
+
+
+def test_table_is_extracted_as_structure(pages):
+    (table,) = pages[2].tables
+    assert isinstance(table, Table)
+    assert table.header == ("Hole", "From (m)", "To (m)", "Au (g/t)")
+    assert table.rows == (
+        ("DH-001", "45.0", "52.0", "3.10"),
+        ("DH-002", "112.0", "118.5", "4.70"),
+    )
+
+
+def test_table_carries_its_caption_and_notes(pages):
+    table = pages[2].tables[0]
+    assert table.caption == TABLE_CAPTION
+    assert table.notes == TABLE_NOTES
+
+
+def test_table_content_is_not_duplicated_in_prose(pages):
+    text = pages[2].text
+    for fragment in ("DH-002", "112.0", TABLE_CAPTION, TABLE_NOTES):
+        assert fragment not in text
+
+
+def test_pages_without_tables_have_none(pages):
+    assert [len(p.tables) for p in pages] == [0, 0, 1, 0]
+
+
+def test_page_is_frozen(pages):
+    with pytest.raises(AttributeError):
+        pages[0].text = "x"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("data", [b"definitely not a pdf", b""])
+def test_unreadable_input_raises_value_error(data):
+    with pytest.raises(ValueError):
+        parse_pdf(data)
+
+
+def grid(*rows):
+    """Build a table grid: each cell is None (covered by a merged cell) or (text, x0, x1)."""
+    return [[GridCell(*c) if c else None for c in row] for row in rows]
+
+
+def test_reconstruct_multi_level_header():
+    # Macraes resource-statement shape: merged group labels ("Measured" spans 3 columns,
+    # covered cells come back as None), units on a second leaf row, a group-label data row
+    # ("Macraes"), a wrapped cell, and an empty spacer row.
+    raw = grid(
+        [("Gold", 0, 50), ("Measured", 50, 80), None, None, ("Indicated", 80, 110), None, None],
+        [None, ("", 50, 80), None, None, ("", 80, 110), None, None],
+        [None, ("Tonnes", 50, 60), ("Au", 60, 70), ("Contained", 70, 80),
+         ("Tonnes", 80, 90), ("Au", 90, 100), ("Contained", 100, 110)],
+        [None, ("(Mt)", 50, 60), ("(g/t)", 60, 70), ("Ozs (Moz)", 70, 80),
+         ("(Mt)", 80, 90), ("(g/t)", 90, 100), ("Ozs (Moz)", 100, 110)],
+        [("Macraes", 0, 50), None, None, None, None, None, None],
+        [("Coronation\nNorth", 0, 50), ("0.14", 50, 60), ("1.23", 60, 70), ("0.01", 70, 80),
+         ("3.06", 80, 90), ("0.63", 90, 100), ("0.06", 100, 110)],
+        [("", 0, 50), ("", 50, 60), ("", 60, 70), ("", 70, 80), ("", 80, 90), ("", 90, 100), ("", 100, 110)],
+    )
+    header, rows = reconstruct_table(raw)
+    assert header == (
+        "Gold",
+        "Measured · Tonnes (Mt)",
+        "Measured · Au (g/t)",
+        "Measured · Contained Ozs (Moz)",
+        "Indicated · Tonnes (Mt)",
+        "Indicated · Au (g/t)",
+        "Indicated · Contained Ozs (Moz)",
+    )
+    assert rows == (
+        ("Macraes", "", "", "", "", "", ""),
+        ("Coronation North", "0.14", "1.23", "0.01", "3.06", "0.63", "0.06"),
+    )
+
+
+def test_reconstruct_uses_geometry_not_grid_position():
+    # Waihi resource-statement shape: double borders create sliver columns (60-66, 130-136,
+    # 170-176) that never hold data; the "Indicated" label cell starts at x=72 while the
+    # Tonnes column under it starts at x=66 (different grid columns, same position on the
+    # page); the "Total Mineral Resources" label is wrapped over three grid rows.
+    def data(label, t, au, inf):
+        return [(label, 0, 60), None, (t, 66, 100), (au, 100, 130), None, (inf, 136, 170), None]
+
+    raw = grid(
+        [("Area", 0, 60), None, ("Indicated", 72, 130), None, ("", 130, 136), ("Inferred", 136, 176), None],
+        [None, None, ("Tonnes", 66, 100), ("Au", 100, 130), None, ("Tonnes", 136, 170), None],
+        [None, None, ("(Mt)", 66, 100), ("(Moz)", 100, 130), None, ("(Mt)", 136, 170), None],
+        data("MOP", "6.50", "0.41", "2.3"),
+        data("GOP", "3.22", "0.15", "0.8"),
+        data("MUG", "6.42", "1.09", "2.7"),
+        data("WUG", "2.39", "1.37", "1.3"),
+        [("", 0, 60), ("Total", 60, 66), ("18.5", 66, 100), ("3.02", 100, 130), None, ("7.1", 136, 170), None],
+        [None, ("Mineral", 60, 66), None, None, None, None, None],
+        [None, ("Resources", 60, 66), None, None, None, None, None],
+    )
+    header, rows = reconstruct_table(raw)
+    assert header == ("Area", "Indicated · Tonnes (Mt)", "Indicated · Au (Moz)", "Inferred · Tonnes (Mt)")
+    assert rows == (
+        ("MOP", "6.50", "0.41", "2.3"),
+        ("GOP", "3.22", "0.15", "0.8"),
+        ("MUG", "6.42", "1.09", "2.7"),
+        ("WUG", "2.39", "1.37", "1.3"),
+        ("Total Mineral Resources", "18.5", "3.02", "7.1"),
+    )
+
+
+
+def test_reconstruct_text_table_with_wrapped_cells():
+    # Macraes p168 shape (tailings dams): each data column is one merged cell three grid
+    # columns wide, the header label sits only over the middle third, and a long cell
+    # wraps over several grid rows that hold nothing else.
+    raw = grid(
+        [("", 0, 30), ("", 30, 40), ("MTI", 40, 50), ("", 50, 60)],
+        [("Status", 0, 30), ("Active closure", 30, 60), None, None],
+        [("Notes", 0, 30), ("Embankment to", 30, 60), None, None],
+        [None, ("design, ongoing", 30, 60), None, None],
+        [None, ("deposition", 30, 60), None, None],
+        [("Impact", 0, 30), ("High", 30, 60), None, None],
+    )
+    header, rows = reconstruct_table(raw)
+    assert header == ("", "MTI")
+    assert rows == (
+        ("Status", "Active closure"),
+        ("Notes", "Embankment to design, ongoing deposition"),
+        ("Impact", "High"),
+    )
+
+# --- caption / notes / label detectors (pure functions over positioned lines) ---------
+
+TABLE_BBOX = (50.0, 200.0, 500.0, 300.0)
+
+
+def line(text, y0, y1, size=10.0):
+    return Line(text=text, x0=50.0, y0=y0, x1=500.0, y1=y1, size=size)
+
+
+def test_caption_is_the_table_line_just_above_including_its_wrapped_lines():
+    lines = [
+        line("Some prose about the deposit.", 150, 162),
+        line("Table 14-3: Mineral Resource Statement", 175, 187),
+        line("as at December 31, 2025", 188, 197),
+    ]
+    assert find_caption(lines, TABLE_BBOX) == (
+        "Table 14-3: Mineral Resource Statement as at December 31, 2025",
+        {1, 2},
+    )
+
+
+def test_no_caption_when_no_table_line_or_too_far_above():
+    assert find_caption([line("Significant intercepts are listed below.", 180, 192)], TABLE_BBOX) == (None, set())
+    assert find_caption([line("Table 1-1 Too far away", 100, 112)], TABLE_BBOX) == (None, set())
+
+
+def test_notes_are_contiguous_smaller_font_lines_below():
+    lines = [
+        line("Notes:", 305, 314, size=8),
+        line("- All figures are rounded.", 318, 327, size=8),
+        line("1.10 Mineral Reserve Estimate", 335, 347, size=12),  # heading: bigger font, stop
+        line("Released: March 27, 2026   Page 21 of 213", 780, 790, size=8),
+    ]
+    assert find_notes(lines, TABLE_BBOX, body_size=10) == ("Notes:\n- All figures are rounded.", {0, 1})
+
+
+def test_notes_stop_at_a_vertical_gap():
+    lines = [line("Note: uncut grades.", 305, 314, size=8), line("small footer text", 360, 370, size=8)]
+    assert find_notes(lines, TABLE_BBOX, body_size=10) == ("Note: uncut grades.", {0})
+
+
+def test_no_notes_when_body_text_follows_the_table():
+    assert find_notes([line("The table shows...", 305, 317, size=10)], TABLE_BBOX, body_size=10) == (None, set())
+
+
+def test_body_font_size_is_the_most_common_size_by_characters():
+    lines = [line("x" * 200, 0, 10, size=11), line("Heading", 20, 30, size=14), line("y" * 50, 40, 50, size=9)]
+    assert body_font_size(lines) == 11
+
+
+@pytest.mark.parametrize(
+    ("pdf_label", "footer", "expected"),
+    [
+        ("iv", None, "iv"),  # a label defined in the PDF wins
+        ("", "Released: March 27, 2026   Page 21 of 213", "21"),
+        ("", "Document ID: STU-063   Page  17  of  215", "17"),
+        ("", "no page number here", None),
+    ],
+)
+def test_page_label(pdf_label, footer, expected):
+    lines = [line(footer, 780, 790)] if footer else []
+    assert page_label(pdf_label, lines, page_height=842) == expected
+
+
+def test_page_label_ignores_page_references_in_body_text():
+    lines = [line("as discussed on Page 5 of 12 in Section 7", 400, 412)]
+    assert page_label("", lines, page_height=842) is None
+
+
+def test_notes_join_a_lone_bullet_glyph_with_its_text():
+    lines = [
+        line("Notes:", 305, 314, size=9),
+        line("▪", 318, 326, size=9),
+        line("Reported inclusive of Mineral Reserves.", 318, 327, size=9),
+    ]
+    notes, _ = find_notes(lines, TABLE_BBOX, body_size=10)
+    assert notes == "Notes:\n▪ Reported inclusive of Mineral Reserves."
+
+
+def test_encrypted_pdf_raises_value_error():
+    doc = pymupdf.open()
+    doc.new_page().insert_text((50, 80), "secret")
+    data = doc.tobytes(encryption=pymupdf.PDF_ENCRYPT_AES_256, owner_pw="owner", user_pw="user")
+    with pytest.raises(ValueError, match="encrypted"):
+        parse_pdf(data)
+
+
+def test_page_with_almost_no_text_is_logged_as_possibly_scanned(caplog):
+    doc = pymupdf.open()
+    doc.new_page()  # blank page: what a scanned image-only page looks like to a text parser
+    with caplog.at_level(logging.WARNING):
+        pages = parse_pdf(doc.tobytes())
+    assert pages[0].text == ""
+    assert "page 1" in caplog.text and "OCR" in caplog.text
