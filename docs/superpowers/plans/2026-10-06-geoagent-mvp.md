@@ -1865,6 +1865,8 @@ git commit -m "test: add synthetic NI 43-101-style fixture PDF generator"
 
 ## Task 10: PDF parser [Developer zone]
 
+> **Status: done (pair-build, 2026-10-13).** Contract changed after surveying the real reports: `Page(number, label, text, tables)` with `Table(caption, header, rows, notes, bbox)`; tables are rebuilt from cell geometry and removed from `text` together with their caption and notes. The committed `geoagent/ingest/parse.py` and `tests/unit/test_parse.py` are the source of truth; the text below is the original plan.
+
 **Files:**
 - Create (DEV): `geoagent/ingest/parse.py`
 - Test (LLM): `tests/unit/test_parse.py`
@@ -1941,6 +1943,8 @@ git commit -m "feat: add PDF parser with table rendering"
 ---
 
 ## Task 11: Chunker [Developer zone]
+
+> **Amendment — structured pages (from Task 10):** the chunker consumes `Page.text` (prose) **and** `Page.tables`. Prose chunks work as specified below. Each table becomes its own chunk: caption + Markdown table (header row + rows) + notes; never split mid-row; if over `max_tokens`, split by rows with the header (and caption) repeated; `chunk_type = "table"` (prose: `"text"`). Open design point to settle at the start of this task: the chunker needs the table's position within the page prose (to know its section) — e.g. add `Table.offset` (character offset in `Page.text`) to the parser. Chunks also carry the printed page labels for citations (`page_label_start/end`), which needs a migration adding `chunk_type`, `page_label_start`, `page_label_end` to `chunks`.
 
 **Files:**
 - Create (DEV): `geoagent/ingest/chunker.py`

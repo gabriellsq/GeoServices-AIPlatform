@@ -428,3 +428,18 @@ Use it for:
 - **Offline/batch:** dedup, clustering, similarity matrices (GPU flat search for millions).
 - **Fresh, not-yet-indexed writes:** search the recent buffer exactly and merge with the ANN results.
 In-process indexes (FAISS, hnswlib) suit read-mostly corpora: very fast, but one copy per instance, rebuild on update, no tenancy/transactions.
+
+---
+
+## 12. PDF parsing (lessons from real NI 43-101 reports)
+
+- **A PDF is drawing instructions, not a document.** Text = glyphs placed at coordinates (`BT … Tm … Tj … ET`); tables = drawn lines; no notion of paragraph, heading, cell or caption. Structure must be *inferred* from position, font and size.
+- **No OCR for born-digital PDFs.** PyMuPDF (MuPDF) decodes the content stream directly. Scanned pages are images → `get_text()` returns nothing → they silently vanish from the index unless you detect near-empty pages and route them to OCR (Tesseract, Document AI).
+- **Survey real data before designing.** The plan assumed simple tables; the reports had 208 tables, merged multi-level headers, double borders, wrapped cells, captions and notes.
+- **Tables carry the most-asked facts** (resource statements, intercepts). Flattening them destroys meaning (`0.63` only means something as "Indicated · Au (g/t)"). Keep structure in the parser; let the chunker decide the representation (table-as-chunk, row-as-sentence, summary + full table, or SQL rows).
+- **Use geometry, not grid indices.** `find_tables()` grids include sliver columns from double borders and labels offset from the columns they label. Assign header labels to columns by horizontal overlap (> half of the narrower width).
+- **Estimate "normal" over the whole document, judge each page against it.** Body font size per page failed on table-heavy pages (the notes became "body"). Per document it is stable.
+- **Search page numbers only in the margins** (`Page N of M`); printed page ≠ PDF page (offset 2 in one report). Store both for citations.
+- **Captions and notes belong with their table:** caption = `Table N` line just above; notes = contiguous smaller-font lines just below. Notes change the meaning of numbers (cut-off grade, "inclusive of Reserves").
+- **Every real document breaks a heuristic** — keep each rule a small pure function with a test copied from the real shape that broke it.
+- Layout-aware alternatives when heuristics stop scaling: Docling, Unstructured, LlamaParse, Google Document AI, `pymupdf4llm` (heavier, less control).
