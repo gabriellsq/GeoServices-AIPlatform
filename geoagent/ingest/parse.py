@@ -217,6 +217,7 @@ def reconstruct_table(grid: Grid) -> tuple[tuple[str, ...], tuple[tuple[str, ...
 _CAPTION = re.compile(r"^Table\s+[A-Z]?\d+(?:[-–.]\d+)*\b", re.IGNORECASE)
 _CAPTION_MAX_GAP = 30.0  # pt between caption and table top
 _NOTES_MAX_GAP = 15.0  # pt between consecutive note lines
+_CAPTION_PUNCT = re.compile(r"^Table\s+[A-Z]?\d+(?:[-–.]\d+)*\s*[:.\-–—]", re.IGNORECASE)
 _BULLET = re.compile(r"[▪•●◦‣∙·\-–*]")
 _PAGE_OF = re.compile(r"\bPage\s+(\d+)\s+of\s+\d+\b", re.IGNORECASE)
 _MARGIN = 0.12  # header/footer zone: top and bottom 12% of the page
@@ -224,7 +225,7 @@ _MARGIN = 0.12  # header/footer zone: top and bottom 12% of the page
 
 @dataclass(frozen=True)
 class Line:
-    """One text line with its position (PDF points, y grows downward) and font size."""
+    """One text line with its position (PDF points, y grows downward) and font."""
 
     text: str
     x0: float
@@ -232,9 +233,26 @@ class Line:
     x1: float
     y1: float
     size: float
+    bold: bool = False
 
 
 Bbox = tuple[float, float, float, float]
+
+
+def _is_caption(line: Line) -> bool:
+    """A "Table N" line that is styled or punctuated like a caption.
+
+    "Table 3 shows the grades..." is prose that merely mentions a table: real captions
+    are bold in the source reports, or put punctuation after the number ("Table 1-1:").
+    """
+    text = line.text.strip()
+    return bool(_CAPTION.match(text)) and (line.bold or bool(_CAPTION_PUNCT.match(text)))
+
+
+def _over(line: Line, bbox: Bbox) -> bool:
+    """The line sits horizontally over/under the table (side-by-side tables stay apart)."""
+    overlap = _overlap(line.x0, line.x1, bbox[0], bbox[2])
+    return overlap > _MIN_OVERLAP * min(line.x1 - line.x0, bbox[2] - bbox[0])
 
 
 def find_caption(lines: Sequence[Line], bbox: Bbox) -> tuple[str | None, set[int]]:
@@ -244,30 +262,41 @@ def find_caption(lines: Sequence[Line], bbox: Bbox) -> tuple[str | None, set[int
     """
     top = bbox[1]
     window = [
-        (i, ln) for i, ln in enumerate(lines) if ln.y1 <= top + 2 and top - ln.y1 <= _CAPTION_MAX_GAP
+        (i, ln)
+        for i, ln in enumerate(lines)
+        if ln.y1 <= top + 2 and top - ln.y1 <= _CAPTION_MAX_GAP and _over(ln, bbox)
     ]
     window.sort(key=lambda item: item[1].y0)
-    starts = [pos for pos, (_, ln) in enumerate(window) if _CAPTION.match(ln.text.strip())]
+    starts = [pos for pos, (_, ln) in enumerate(window) if _is_caption(ln)]
     if not starts:
         return None, set()
     used = window[starts[-1] :]
     return _clean(" ".join(ln.text for _, ln in used)), {i for i, _ in used}
 
 
-def find_notes(lines: Sequence[Line], bbox: Bbox, body_size: float) -> tuple[str | None, set[int]]:
+def find_notes(
+    lines: Sequence[Line], bbox: Bbox, body_size: float, page_height: float | None = None
+) -> tuple[str | None, set[int]]:
     """Contiguous smaller-font lines directly below the table (sources, footnotes).
 
     Stops at the first line that is not smaller than body text (a heading, the next
-    paragraph) or that starts after a vertical gap (the page footer).
+    paragraph), that starts after a vertical gap, that is another table's caption, or
+    that lies in the footer zone (small, close footers look exactly like notes).
     """
+    footer_top = (1 - _MARGIN) * page_height if page_height else float("inf")
     previous_bottom = bbox[3]
     below = sorted(
-        ((i, ln) for i, ln in enumerate(lines) if ln.y0 >= bbox[3] - 2),
+        ((i, ln) for i, ln in enumerate(lines) if ln.y0 >= bbox[3] - 2 and _over(ln, bbox)),
         key=lambda item: (item[1].y0, item[1].x0),  # same baseline: bullet glyph before its text
     )
     used: list[tuple[int, Line]] = []
     for i, ln in below:
-        if ln.y0 - previous_bottom > _NOTES_MAX_GAP or ln.size >= body_size - 0.5:
+        if (
+            ln.y0 - previous_bottom > _NOTES_MAX_GAP
+            or ln.size >= body_size - 0.5
+            or ln.y0 >= footer_top
+            or _is_caption(ln)
+        ):
             break
         used.append((i, ln))
         previous_bottom = max(previous_bottom, ln.y1)
@@ -308,6 +337,37 @@ def page_label(pdf_label: str, lines: Sequence[Line], page_height: float) -> str
             if match:
                 return match.group(1)
     return None
+
+
+RawTable = tuple[Bbox, tuple[str, ...], tuple[tuple[str, ...], ...]]  # bbox, header, rows
+
+
+def attach_captions_and_notes(
+    lines: Sequence[Line], tables: Sequence[RawTable], body_size: float, page_height: float
+) -> tuple[list[Table], set[int]]:
+    """Give each table its caption and notes; every line is claimed by at most one table.
+
+    Tables are processed top-to-bottom, left-to-right, and a line taken by one table is
+    no longer a candidate for the next (stacked tables: A's notes cannot swallow B's
+    caption). Returns the tables and the indices of all lines they claimed, including
+    the lines inside them.
+    """
+    claimed = {i for i, ln in enumerate(lines) if any(_inside(ln, bbox) for bbox, _, _ in tables)}
+
+    def unclaimed() -> tuple[list[int], list[Line]]:
+        free = [i for i in range(len(lines)) if i not in claimed]
+        return free, [lines[i] for i in free]
+
+    out = []
+    for bbox, header, rows in sorted(tables, key=lambda t: (t[0][1], t[0][0])):
+        free, candidates = unclaimed()
+        caption, used = find_caption(candidates, bbox)
+        claimed |= {free[i] for i in used}
+        free, candidates = unclaimed()
+        notes, used = find_notes(candidates, bbox, body_size, page_height)
+        claimed |= {free[i] for i in used}
+        out.append(Table(caption, header, rows, notes, bbox))
+    return out, claimed
 
 
 # --- PDF → pages ------------------------------------------------------------------
@@ -352,7 +412,9 @@ def _page_lines(page: pymupdf.Page) -> list[Line]:
             if spans:
                 x0, y0, x1, y1 = raw["bbox"]
                 text = _clean("".join(s["text"] for s in raw["spans"]))
-                lines.append(Line(text, x0, y0, x1, y1, median(s["size"] for s in spans)))
+                size = median(s["size"] for s in spans)
+                bold = all(s["flags"] & 16 or "bold" in s["font"].lower() for s in spans)
+                lines.append(Line(text, x0, y0, x1, y1, size, bold))
     return lines
 
 
@@ -378,8 +440,9 @@ class _Scan:
 
     number: int
     label: str | None
+    height: float
     lines: list[Line]
-    tables: list[tuple[Bbox, tuple[str, ...], tuple[tuple[str, ...], ...]]]
+    tables: list[RawTable]
     in_table: set[int]
 
 
@@ -393,20 +456,11 @@ def _scan_page(page: pymupdf.Page) -> _Scan:
         tables.append((tuple(found.bbox), header, rows))
     in_table = {i for i, ln in enumerate(lines) if any(_inside(ln, bbox) for bbox, _, _ in tables)}
     label = page_label(page.get_label(), lines, page.rect.height)
-    return _Scan(page.number + 1, label, lines, tables, in_table)
+    return _Scan(page.number + 1, label, page.rect.height, lines, tables, in_table)
 
 
 def _build_page(scan: _Scan, body: float) -> Page:
-    prose_idx = [i for i in range(len(scan.lines)) if i not in scan.in_table]
-    prose = [scan.lines[i] for i in prose_idx]
-    used = set(scan.in_table)
-    tables = []
-    for bbox, header, rows in scan.tables:
-        caption, caption_used = find_caption(prose, bbox)
-        notes, notes_used = find_notes(prose, bbox, body)
-        used |= {prose_idx[i] for i in caption_used | notes_used}
-        tables.append(Table(caption, header, rows, notes, bbox))
-
+    tables, used = attach_captions_and_notes(scan.lines, scan.tables, body, scan.height)
     text = "\n".join(ln.text for i, ln in enumerate(scan.lines) if i not in used)
     if len(text) < _MIN_PAGE_CHARS and not tables:
         log.warning("page %d has almost no text; it may be a scanned image that needs OCR", scan.number)

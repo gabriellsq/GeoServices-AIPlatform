@@ -8,6 +8,7 @@ from geoagent.ingest.parse import (
     Line,
     Page,
     Table,
+    attach_captions_and_notes,
     body_font_size,
     find_caption,
     find_notes,
@@ -389,3 +390,64 @@ def test_leading_empty_rows_are_ignored():
     header, rows = reconstruct_table(raw)
     assert header == ("Ore Class", "Au", "Ag")
     assert rows == (("High", "1.6", "2.6"),)
+
+
+# --- caption / notes ownership (review findings #6, #7) ------------------------------
+
+LOW_TABLE = (50.0, 600.0, 500.0, 770.0)  # a table ending near the bottom of an 842 pt page
+
+
+def test_footer_is_not_notes():
+    footer = line("Released: 11th December 2024   Page 86 of 215", 780, 790, size=8)
+    assert find_notes([footer], LOW_TABLE, body_size=10, page_height=842) == (None, set())
+
+
+def test_notes_stop_at_the_next_tables_caption():
+    lines = [line("Source: first survey", 305, 314, size=8), line("Table 2: Second table", 318, 327, size=8)]
+    assert find_notes(lines, TABLE_BBOX, body_size=10) == ("Source: first survey", {0})
+
+
+def test_caption_must_sit_over_the_table():
+    side = Line("Table 4: Right-hand table", x0=600, y0=180, x1=900, y1=192, size=10, bold=True)
+    assert find_caption([side], TABLE_BBOX) == (None, set())
+
+
+def test_prose_mentioning_a_table_is_not_a_caption():
+    prose = line("Table 3 shows the grades of the main intercepts", 180, 192)
+    caption = Line("Table 3 Main intercepts", x0=50, y0=180, x1=500, y1=192, size=10, bold=True)
+    assert find_caption([prose], TABLE_BBOX) == (None, set())
+    assert find_caption([caption], TABLE_BBOX) == ("Table 3 Main intercepts", {0})
+
+
+def test_each_line_belongs_to_one_table_only():
+    # Two stacked tables: table A's notes must not swallow table B's caption.
+    a, b = (50.0, 100.0, 500.0, 200.0), (50.0, 240.0, 500.0, 340.0)
+    lines = [
+        Line("Table 1: First", x0=50, y0=85, x1=300, y1=96, size=10, bold=True),
+        line("Source: survey A", 204, 212, size=8),
+        Line("Table 2: Second", x0=50, y0=222, x1=300, y1=233, size=8, bold=True),
+        line("Body text after both tables.", 360, 372),
+    ]
+    tables, used = attach_captions_and_notes(
+        lines, [(b, ("x",), ()), (a, ("y",), ())], body_size=10, page_height=842
+    )
+    by_top = {t.bbox[1]: t for t in tables}
+    assert by_top[100.0].caption == "Table 1: First" and by_top[100.0].notes == "Source: survey A"
+    assert by_top[240.0].caption == "Table 2: Second" and by_top[240.0].notes is None
+    assert used == {0, 1, 2}
+
+
+def test_side_by_side_tables_get_their_own_caption_and_notes():
+    left, right = (50.0, 200.0, 280.0, 300.0), (320.0, 200.0, 550.0, 300.0)
+    lines = [
+        Line("Table 3: Left", x0=50, y0=185, x1=200, y1=196, size=10, bold=True),
+        Line("Table 4: Right", x0=320, y0=185, x1=470, y1=196, size=10, bold=True),
+        Line("Source: left", x0=50, y0=304, x1=200, y1=312, size=8),
+        Line("Source: right", x0=320, y0=304, x1=470, y1=312, size=8),
+    ]
+    tables, _ = attach_captions_and_notes(
+        lines, [(left, ("a",), ()), (right, ("b",), ())], body_size=10, page_height=842
+    )
+    by_left = {t.bbox[0]: t for t in tables}
+    assert (by_left[50.0].caption, by_left[50.0].notes) == ("Table 3: Left", "Source: left")
+    assert (by_left[320.0].caption, by_left[320.0].notes) == ("Table 4: Right", "Source: right")
