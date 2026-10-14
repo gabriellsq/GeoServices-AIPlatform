@@ -259,3 +259,56 @@ def test_page_with_almost_no_text_is_logged_as_possibly_scanned(caplog):
         pages = parse_pdf(doc.tobytes())
     assert pages[0].text == ""
     assert "page 1" in caplog.text and "OCR" in caplog.text
+
+
+# --- robustness (review findings #3, #4, #5) ---------------------------------------
+
+ZERO_PAGE_PDF = (
+    b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"2 0 obj<</Type/Pages/Kids[]/Count 0>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF"
+)
+
+
+def png_bytes() -> bytes:
+    return pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 4, 4), False).tobytes("png")
+
+
+@pytest.mark.parametrize(
+    "make", [lambda: b"<html>x</html>", png_bytes, lambda: ZERO_PAGE_PDF], ids=["html", "png", "zero-pages"]
+)
+def test_non_pdf_and_empty_documents_raise_value_error(make):
+    with pytest.raises(ValueError):
+        parse_pdf(make())
+
+
+def test_truncated_pdf_is_parsed_with_a_warning(caplog):
+    data = build_fixture_pdf()
+    with caplog.at_level(logging.WARNING):
+        pages = parse_pdf(data[: len(data) // 2])
+    assert pages  # MuPDF repairs what it can...
+    assert "repaired" in caplog.text  # ...and we say so, because content may be missing
+
+
+def test_errors_during_processing_become_value_error(monkeypatch):
+    def broken(self, *args, **kwargs):
+        raise RuntimeError("malformed page tree")
+
+    monkeypatch.setattr(pymupdf.Page, "find_tables", broken)
+    with pytest.raises(ValueError, match="malformed page tree"):
+        parse_pdf(build_fixture_pdf())
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        [],
+        [[]],
+        [[None]],
+        [[GridCell("A", 0, 10), GridCell("B", 10, 20)], [GridCell("x", 0, 10)]],  # ragged
+        [[GridCell("A", 0, 10)], [None], [None]],  # body of merged-only cells
+    ],
+    ids=["empty", "empty-row", "single-none", "ragged", "all-none-body"],
+)
+def test_reconstruct_degenerate_grids_do_not_raise(raw):
+    header, rows = reconstruct_table(raw)
+    assert isinstance(header, tuple) and isinstance(rows, tuple)

@@ -92,6 +92,8 @@ def _real_columns(head: Grid, body: Grid) -> list[int]:
 
 def _column_span(rows: Grid, col: int) -> tuple[float, float]:
     cells = [row[col] for row in rows if row[col] is not None]
+    if not cells:
+        return 0.0, 0.0
     return median(c.x0 for c in cells), median(c.x1 for c in cells)
 
 
@@ -171,9 +173,13 @@ def _fold_rows(body: Grid, keep: list[int]) -> tuple[tuple[str, ...], ...]:
 
 def reconstruct_table(grid: Grid) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]:
     """Turn a PyMuPDF table grid into (column names, data rows) using cell geometry."""
-    if not grid:
+    width = max((len(row) for row in grid), default=0)
+    if width == 0 or not any(cell for row in grid for cell in row):
         return (), ()
-    rows = [[GridCell(_clean(c.text), c.x0, c.x1) if c else None for c in row] for row in grid]
+    rows = [
+        [GridCell(_clean(c.text), c.x0, c.x1) if c else None for c in row] + [None] * (width - len(row))
+        for row in grid  # ragged grids are padded so every row has the same width
+    ]
     n_header = _header_row_count(rows)
     head, body = rows[:n_header], rows[n_header:]
     keep = _real_columns(head, body)
@@ -286,17 +292,31 @@ def page_label(pdf_label: str, lines: Sequence[Line], page_height: float) -> str
 _MIN_PAGE_CHARS = 50  # below this, a page is probably an image (scan) and needs OCR
 
 
+# MuPDF's own errors (FzErrorFormat, ...) derive from FzErrorBase, which is NOT a
+# RuntimeError: both families must be caught to keep the ValueError-only contract.
+_MUPDF_ERRORS = (pymupdf.mupdf.FzErrorBase, RuntimeError)
+
+
 def _open(data: bytes) -> pymupdf.Document:
     """Open PDF bytes; every unreadable input becomes ValueError (callers never see PyMuPDF errors)."""
     if not data:
         raise ValueError("empty PDF data")
     try:
         doc = pymupdf.open(stream=data, filetype="pdf")
-    except (pymupdf.FileDataError, RuntimeError) as exc:
+    except _MUPDF_ERRORS as exc:
         raise ValueError(f"not a readable PDF: {exc}") from exc
-    if doc.needs_pass:
+    problem = None
+    if not doc.is_pdf:  # MuPDF sniffs content: HTML or PNG bytes "open" as other formats
+        problem = "not a PDF"
+    elif doc.needs_pass:
+        problem = "encrypted PDF: a password is required"
+    elif doc.page_count == 0:
+        problem = "PDF has no pages"
+    if problem:
         doc.close()
-        raise ValueError("encrypted PDF: a password is required")
+        raise ValueError(problem)
+    if doc.is_repaired:
+        log.warning("PDF was damaged and repaired on open; some content may be missing")
     return doc
 
 
@@ -360,13 +380,19 @@ def parse_pdf(data: bytes) -> list[Page]:
     Raises ValueError for empty, corrupt or encrypted input.
     """
     with _open(data) as doc:
-        scanned = []
-        for page in doc:
-            found = page.find_tables().tables
-            lines = _page_lines(page)
-            in_table = {i for i, ln in enumerate(lines) if any(_inside(ln, t.bbox) for t in found)}
-            scanned.append((page, found, lines, in_table))
-        body = body_font_size(
-            [ln for _, _, lines, in_table in scanned for i, ln in enumerate(lines) if i not in in_table]
-        )
-        return [_build_page(page, found, lines, in_table, body) for page, found, lines, in_table in scanned]
+        try:
+            scanned = []
+            for page in doc:
+                found = page.find_tables().tables
+                lines = _page_lines(page)
+                in_table = {i for i, ln in enumerate(lines) if any(_inside(ln, t.bbox) for t in found)}
+                scanned.append((page, found, lines, in_table))
+            body = body_font_size(
+                [ln for _, _, lines, in_table in scanned for i, ln in enumerate(lines) if i not in in_table]
+            )
+            return [
+                _build_page(page, found, lines, in_table, body)
+                for page, found, lines, in_table in scanned
+            ]
+        except _MUPDF_ERRORS as exc:  # e.g. a malformed page tree discovered mid-document
+            raise ValueError(f"PDF could not be processed: {exc}") from exc
