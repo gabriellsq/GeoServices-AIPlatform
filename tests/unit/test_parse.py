@@ -312,3 +312,80 @@ def test_errors_during_processing_become_value_error(monkeypatch):
 def test_reconstruct_degenerate_grids_do_not_raise(raw):
     header, rows = reconstruct_table(raw)
     assert isinstance(header, tuple) and isinstance(rows, tuple)
+
+
+# --- table content (review findings #2a, #8, #9) -----------------------------------
+
+
+def test_lone_number_below_a_number_starts_a_new_row():
+    # Waihi GeoMet shape: a single-value row under a numeric cell is a new row, not a
+    # wrapped continuation ("864,072 0" would be a corrupted number).
+    raw = grid(
+        [("Op", 0, 50), ("Tonnes", 50, 90)],
+        [("Pit A", 0, 50), ("864,072", 50, 90)],
+        [None, ("0", 50, 90)],
+    )
+    _, rows = reconstruct_table(raw)
+    assert rows == (("Pit A", "864,072"), ("", "0"))
+
+
+def test_doubled_border_cells_are_not_duplicated():
+    # Macraes p104 shape: some cells are drawn twice (outer + inner border); the inner
+    # copy lands in an extra grid column that is folded back into the real column.
+    raw = grid(
+        [("Domain", 0, 50), None, ("Search", 50, 100), None],
+        [("Coronation", 0, 50), ("Coronation Dom1", 4, 46), ("0.2", 50, 100), ("0.2", 56, 94)],
+        [("Deepdell", 0, 50), None, ("0.3", 50, 100), None],
+        [("Innes", 0, 50), None, ("0.4", 50, 100), None],
+    )
+    header, rows = reconstruct_table(raw)
+    assert header == ("Domain", "Search")
+    assert rows == (("Coronation Dom1", "0.2"), ("Deepdell", "0.3"), ("Innes", "0.4"))
+
+
+def test_header_continuation_needs_a_merged_first_cell():
+    # Only a first cell covered by the vertically merged top-left label (None) continues
+    # the header; a real empty cell ("") starts the data, even with no numbers in the row.
+    raw = grid(
+        [("A", 0, 50), ("B", 50, 100), ("C", 100, 150)],
+        [("", 0, 50), ("text one", 50, 100), ("note a", 100, 150)],
+        [("", 0, 50), ("text two", 50, 100), ("note b", 100, 150)],
+    )
+    header, rows = reconstruct_table(raw)
+    assert header == ("A", "B", "C")
+    assert rows == (("", "text one", "note a"), ("", "text two", "note b"))
+
+
+def test_header_is_at_most_four_rows():
+    raw = grid(
+        [("A", 0, 50), ("B", 50, 100)],
+        *[[None, (f"h{i}", 50, 100)] for i in range(5)],
+        [("x", 0, 50), ("1", 50, 100)],
+    )
+    header, rows = reconstruct_table(raw)
+    assert header == ("A", "B h0 h1 h2")
+    assert rows[0] == ("", "h3 h4") and rows[-1] == ("x", "1")
+
+
+def test_bordered_text_box_stays_in_prose():
+    # Waihi p165 shape: a paragraph inside a single bordered box is not a table.
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.draw_rect(pymupdf.Rect(50, 100, 500, 160), color=(0, 0, 0), width=0.5)
+    page.insert_text((60, 130), "A paragraph drawn inside a bordered box, not a table.", fontsize=10)
+    (parsed,) = parse_pdf(doc.tobytes())
+    assert parsed.tables == ()
+    assert "inside a bordered box" in parsed.text
+
+
+def test_leading_empty_rows_are_ignored():
+    # Waihi p86 shape: the table bbox includes blank grid rows above the real header.
+    raw = grid(
+        [None, None, ("", 90, 120)],
+        [None, None, ("", 90, 120)],
+        [("Ore Class", 0, 50), ("Au", 50, 90), ("Ag", 90, 120)],
+        [("High", 0, 50), ("1.6", 50, 90), ("2.6", 90, 120)],
+    )
+    header, rows = reconstruct_table(raw)
+    assert header == ("Ore Class", "Au", "Ag")
+    assert rows == (("High", "1.6", "2.6"),)

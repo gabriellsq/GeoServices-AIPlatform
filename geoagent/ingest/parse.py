@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 
 _NUMERIC = re.compile(r"^[-+]?\d[\d,]*(\.\d+)?%?$")
 _MIN_OVERLAP = 0.5  # a header label owns a column when it covers > half its width
+_MAX_HEADER_ROWS = 4  # Macraes resource header: group, spacer, label, units
 
 
 @dataclass(frozen=True)
@@ -62,14 +63,15 @@ def _dedupe(parts: list[str]) -> list[str]:
 
 
 def _header_row_count(rows: Grid) -> int:
-    """Row 0, plus following rows whose first cell is blank and that hold no numbers.
+    """Row 0, plus up to three following rows whose first cell is merged and that hold no numbers.
 
-    Multi-level headers leave the first column empty under the top-left label
-    ("Gold", "Area"); the first data row has a name there ("Macraes", "MOP").
+    In a multi-level header the top-left label ("Gold", "Area") is one cell merged down
+    over the header rows, so their first cell comes back as None. A real empty cell ("")
+    or a name ("Macraes", "MOP") starts the data.
     """
     count = 1
-    for row in rows[1:]:
-        if _text(row[0]) or any(_NUMERIC.match(_text(c)) for c in row):
+    for row in rows[1:_MAX_HEADER_ROWS]:
+        if row[0] is not None or any(_NUMERIC.match(_text(c)) for c in row):
             break
         count += 1
     return count
@@ -137,6 +139,21 @@ def _column_names(head: Grid, spans: list[tuple[float, float]]) -> tuple[str, ..
     )
 
 
+def _merge_text(existing: str, new: str) -> str:
+    """Append a folded fragment to a cell, dropping copies from doubled cell borders.
+
+    Double-bordered cells appear twice in the grid (outer and inner cell): "0.2" + "0.2"
+    stays "0.2", "Coronation" + "Coronation Dom1" becomes "Coronation Dom1". Comparison
+    is by whole tokens, so "1" + "10" stays "1 10".
+    """
+    old, add = existing.split(), new.split()
+    if old[: len(add)] == add:
+        return existing
+    if add[: len(old)] == old:
+        return new
+    return f"{existing} {new}"
+
+
 def _nearest_kept(col: int, keep: list[int]) -> int:
     """Index (into keep) of the closest real column at or left of col, else the first one."""
     left = [i for i, k in enumerate(keep) if k <= col]
@@ -150,7 +167,8 @@ def _fold_rows(body: Grid, keep: list[int]) -> tuple[tuple[str, ...], ...]:
     single filled cell continues the row above (text wrapped over several grid rows):
     outside the first column always ("design, ongoing"), in the first column only after
     a row with numbers ("Total" / "Mineral" / "Resources"). A first-column-only row
-    anywhere else is a group label ("Macraes") and is kept.
+    anywhere else is a group label ("Macraes") and is kept. A lone number under a
+    number is a new row: joining them would corrupt the value ("864,072 0").
     """
     out: list[list[str]] = []
     for row in body:
@@ -158,14 +176,17 @@ def _fold_rows(body: Grid, keep: list[int]) -> tuple[tuple[str, ...], ...]:
         for col, cell in enumerate(row):
             if cell is not None and cell.text:
                 i = _nearest_kept(col, keep)
-                cells[i] = f"{cells[i]} {cell.text}".strip()
+                cells[i] = _merge_text(cells[i], cell.text)
         filled = [i for i, v in enumerate(cells) if v]
         if not filled:
             continue
         if out and len(filled) == 1:
             (i,) = filled
-            if i > 0 or any(_NUMERIC.match(v) for v in out[-1][1:]):
-                out[-1][i] = f"{out[-1][i]} {cells[i]}".strip()
+            above = out[-1][i]
+            fuses_numbers = bool(above) and _NUMERIC.match(above) and _NUMERIC.match(cells[i])
+            wraps = i > 0 or any(_NUMERIC.match(v) for v in out[-1][1:])
+            if wraps and not fuses_numbers:
+                out[-1][i] = _merge_text(above, cells[i])
                 continue
         out.append(cells)
     return tuple(tuple(r) for r in out)
@@ -180,6 +201,8 @@ def reconstruct_table(grid: Grid) -> tuple[tuple[str, ...], tuple[tuple[str, ...
         [GridCell(_clean(c.text), c.x0, c.x1) if c else None for c in row] + [None] * (width - len(row))
         for row in grid  # ragged grids are padded so every row has the same width
     ]
+    while rows and not any(_text(c) for c in rows[0]):  # blank space inside the table bbox
+        rows.pop(0)
     n_header = _header_row_count(rows)
     head, body = rows[:n_header], rows[n_header:]
     keep = _real_columns(head, body)
@@ -349,50 +372,61 @@ def _inside(line: Line, bbox: Bbox) -> bool:
     return bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]
 
 
-def _build_page(
-    page: pymupdf.Page, found: list[Any], lines: list[Line], in_table: set[int], body: float
-) -> Page:
-    prose_idx = [i for i in range(len(lines)) if i not in in_table]
-    prose = [lines[i] for i in prose_idx]
-    used = set(in_table)
+@dataclass
+class _Scan:
+    """Pass-1 result for one page: plain data only, so no PyMuPDF objects outlive pass 1."""
+
+    number: int
+    label: str | None
+    lines: list[Line]
+    tables: list[tuple[Bbox, tuple[str, ...], tuple[tuple[str, ...], ...]]]
+    in_table: set[int]
+
+
+def _scan_page(page: pymupdf.Page) -> _Scan:
+    lines = _page_lines(page)
     tables = []
-    for table in found:
-        bbox = tuple(table.bbox)
+    for found in page.find_tables().tables:
+        header, rows = reconstruct_table(_grid(found))
+        if len(header) <= 1 and not rows:  # a bordered text box, not a table: keep it as prose
+            continue
+        tables.append((tuple(found.bbox), header, rows))
+    in_table = {i for i, ln in enumerate(lines) if any(_inside(ln, bbox) for bbox, _, _ in tables)}
+    label = page_label(page.get_label(), lines, page.rect.height)
+    return _Scan(page.number + 1, label, lines, tables, in_table)
+
+
+def _build_page(scan: _Scan, body: float) -> Page:
+    prose_idx = [i for i in range(len(scan.lines)) if i not in scan.in_table]
+    prose = [scan.lines[i] for i in prose_idx]
+    used = set(scan.in_table)
+    tables = []
+    for bbox, header, rows in scan.tables:
         caption, caption_used = find_caption(prose, bbox)
         notes, notes_used = find_notes(prose, bbox, body)
         used |= {prose_idx[i] for i in caption_used | notes_used}
-        header, rows = reconstruct_table(_grid(table))
         tables.append(Table(caption, header, rows, notes, bbox))
 
-    number = page.number + 1
-    text = "\n".join(ln.text for i, ln in enumerate(lines) if i not in used)
+    text = "\n".join(ln.text for i, ln in enumerate(scan.lines) if i not in used)
     if len(text) < _MIN_PAGE_CHARS and not tables:
-        log.warning("page %d has almost no text; it may be a scanned image that needs OCR", number)
-    return Page(number, page_label(page.get_label(), lines, page.rect.height), text, tuple(tables))
+        log.warning("page %d has almost no text; it may be a scanned image that needs OCR", scan.number)
+    return Page(scan.number, scan.label, text, tuple(tables))
 
 
 def parse_pdf(data: bytes) -> list[Page]:
     """Parse PDF bytes into pages of prose plus structured tables.
 
-    Two passes: the first collects every page's lines and tables so the body font size
-    can be measured over the whole document (per page it fails on table-heavy pages);
-    the second assigns captions and notes to tables and keeps the rest as prose.
-    Raises ValueError for empty, corrupt or encrypted input.
+    Two passes: the first extracts every page's lines and tables as plain data, so the
+    body font size can be measured over the whole document (per page it fails on
+    table-heavy pages); the second assigns captions and notes to tables and keeps the
+    rest as prose. Raises ValueError for empty, corrupt, encrypted or non-PDF input.
     """
     with _open(data) as doc:
         try:
-            scanned = []
-            for page in doc:
-                found = page.find_tables().tables
-                lines = _page_lines(page)
-                in_table = {i for i, ln in enumerate(lines) if any(_inside(ln, t.bbox) for t in found)}
-                scanned.append((page, found, lines, in_table))
+            scans = [_scan_page(page) for page in doc]
             body = body_font_size(
-                [ln for _, _, lines, in_table in scanned for i, ln in enumerate(lines) if i not in in_table]
+                [ln for s in scans for i, ln in enumerate(s.lines) if i not in s.in_table]
             )
-            return [
-                _build_page(page, found, lines, in_table, body)
-                for page, found, lines, in_table in scanned
-            ]
+            return [_build_page(scan, body) for scan in scans]
         except _MUPDF_ERRORS as exc:  # e.g. a malformed page tree discovered mid-document
             raise ValueError(f"PDF could not be processed: {exc}") from exc
