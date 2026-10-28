@@ -5,12 +5,14 @@ import pytest
 
 from geoagent.ingest.parse import (
     GridCell,
+    Heading,
     Line,
     Page,
     Table,
     attach_captions_and_notes,
     body_font_size,
     find_caption,
+    find_headings,
     find_notes,
     page_label,
     parse_pdf,
@@ -451,3 +453,69 @@ def test_side_by_side_tables_get_their_own_caption_and_notes():
     by_left = {t.bbox[0]: t for t in tables}
     assert (by_left[50.0].caption, by_left[50.0].notes) == ("Table 3: Left", "Source: left")
     assert (by_left[320.0].caption, by_left[320.0].notes) == ("Table 4: Right", "Source: right")
+
+
+def test_table_records_its_position_in_the_page_prose(pages):
+    # The chunker needs to know where the table sat: after the 6 prose lines above it
+    # (running header + 5 body lines on fixture page 3).
+    table = pages[2].tables[0]
+    lines = pages[2].text.splitlines()
+    assert table.line_index == 6
+    assert lines[table.line_index - 1] == "Significant intercepts are listed in the table below."
+
+
+# --- headings (typography: the chunker only sees plain text) ---------------------------
+
+
+def styled(text, y0, size, bold=False):
+    return Line(text=text, x0=72, y0=y0, x1=400, y1=y0 + size + 2, size=size, bold=bold)
+
+
+def test_headings_are_lines_larger_than_body_text():
+    lines = [
+        styled("11", 100, 14, bold=True),  # Waihi: the section number on its own line...
+        styled("SAMPLE PREPARATION, ANALYSES, AND SECURITY", 100, 14, bold=True),  # ...then the title
+        styled("Samples were collected from drill core.", 130, 10),
+        styled("Sampling Methods and Preparation", 160, 12, bold=True),  # unnumbered subsection
+        styled("1.10 Mineral Reserve Estimate", 200, 12),  # Macraes: larger, not bold
+        styled("Table 1-1: Summary", 230, 10, bold=True),  # body-size bold: not a heading
+    ]
+    assert find_headings(lines, body_size=10) == (
+        Heading(0, 2, "11 SAMPLE PREPARATION, ANALYSES, AND SECURITY"),
+        Heading(3, 4, "Sampling Methods and Preparation"),
+        Heading(4, 5, "1.10 Mineral Reserve Estimate"),
+    )
+
+
+def test_wrapped_heading_lines_are_merged():
+    lines = [styled("MINERAL RESOURCE", 100, 14), styled("ESTIMATES", 116, 14), styled("Body.", 150, 10)]
+    assert find_headings(lines, body_size=10) == (Heading(0, 2, "MINERAL RESOURCE ESTIMATES"),)
+
+
+def test_large_sentences_and_lone_numbers_are_not_headings():
+    lines = [styled("This is an emphasised sentence.", 100, 14), styled("7", 140, 14), styled("Body.", 170, 10)]
+    assert find_headings(lines, body_size=10) == ()
+
+
+def test_table_of_contents_entries_are_not_headings():
+    # Macraes sets its table of contents in the heading font; dot leaders give it away.
+    lines = [
+        styled("1 Summary ........................................ 14", 100, 12),
+        styled("2 Introduction ................................... 30", 120, 12),
+        styled("Body.", 150, 10),
+    ]
+    assert find_headings(lines, body_size=10) == ()
+
+
+def test_wrapped_table_of_contents_entry_is_not_a_heading():
+    lines = [
+        styled("5 Accessibility, Climate, Physiography, Local Resources, and", 100, 12),
+        styled("Infrastructure ...................................... 43", 114, 12),
+        styled("Body.", 150, 10),
+    ]
+    assert find_headings(lines, body_size=10) == ()
+
+
+def test_fixture_headings_are_body_size_so_none_are_found(pages):
+    # The fixture draws headings in the body font: the chunker falls back to numbering.
+    assert all(p.headings == () for p in pages)

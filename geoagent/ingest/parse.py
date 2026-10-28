@@ -3,7 +3,7 @@
 import logging
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from statistics import median
 from typing import Any
 
@@ -35,6 +35,14 @@ class Table:
     rows: tuple[tuple[str, ...], ...]  # data rows, same width as header
     notes: str | None
     bbox: tuple[float, float, float, float]
+    line_index: int = 0  # number of Page.text lines before the table
+
+
+@dataclass(frozen=True)
+class Heading:
+    start: int  # first Page.text line of the heading
+    end: int  # one past the last line (a heading can span lines: "11" + title)
+    text: str  # the heading as one line, e.g. "11 SAMPLE PREPARATION, ANALYSES, AND SECURITY"
 
 
 @dataclass(frozen=True)
@@ -43,6 +51,7 @@ class Page:
     label: str | None  # printed page number, when detectable
     text: str  # prose only: tables, captions and notes removed
     tables: tuple[Table, ...]
+    headings: tuple[Heading, ...] = ()  # detected from typography (size), over Page.text lines
 
 
 def _clean(text: str | None) -> str:
@@ -339,6 +348,61 @@ def page_label(pdf_label: str, lines: Sequence[Line], page_height: float) -> str
     return None
 
 
+_SECTION_NUMBER = re.compile(r"\d{1,2}(?:\.\d{1,2})*\.?")
+_HEADING_MIN_EXTRA_SIZE = 1.0  # pt above body size
+_HEADING_MAX_CHARS = 120
+
+
+_DOT_LEADER = re.compile(r"(\.\s?){4,}|…{2,}")  # table-of-contents "Summary ....... 14"
+
+
+def _heading_styled(line: Line, body_size: float) -> bool:
+    return (
+        line.size >= body_size + _HEADING_MIN_EXTRA_SIZE
+        and len(line.text) <= _HEADING_MAX_CHARS
+        and not _DOT_LEADER.search(line.text)
+    )
+
+
+def find_headings(lines: Sequence[Line], body_size: float) -> tuple[Heading, ...]:
+    """Section headings from typography: lines at least 1 pt larger than body text.
+
+    Some reports number headings in the text ("1.10 Mineral Reserve Estimate"), others
+    draw the number as a separate line ("11" / "SAMPLE PREPARATION...") or not at all;
+    size is the signal they share. A bare number joins the title that follows; a title
+    wrapped over tightly spaced lines of the same size is merged; lines that end like a
+    sentence are emphasis, not headings.
+    """
+    out: list[Heading] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not _heading_styled(line, body_size):
+            i += 1
+            continue
+        start, parts = i, [line.text]
+        if _SECTION_NUMBER.fullmatch(line.text):
+            nxt = lines[i + 1] if i + 1 < len(lines) else None
+            if nxt is None or not _heading_styled(nxt, body_size):
+                i += 1  # a lone big number (a page or figure number), not a heading
+                continue
+            i += 1
+            parts.append(nxt.text)
+        while (
+            i + 1 < len(lines)
+            and abs(lines[i + 1].size - lines[i].size) <= 0.5
+            and lines[i + 1].y0 - lines[i].y1 < 0.5 * lines[i].size
+            and not _SECTION_NUMBER.match(lines[i + 1].text)
+        ):
+            i += 1
+            parts.append(lines[i].text)
+        text = _clean(" ".join(parts))
+        if not text.endswith((".", ",", ";")) and not _DOT_LEADER.search(text):
+            out.append(Heading(start, i + 1, text))
+        i += 1
+    return tuple(out)
+
+
 RawTable = tuple[Bbox, tuple[str, ...], tuple[tuple[str, ...], ...]]  # bbox, header, rows
 
 
@@ -461,10 +525,13 @@ def _scan_page(page: pymupdf.Page) -> _Scan:
 
 def _build_page(scan: _Scan, body: float) -> Page:
     tables, used = attach_captions_and_notes(scan.lines, scan.tables, body, scan.height)
-    text = "\n".join(ln.text for i, ln in enumerate(scan.lines) if i not in used)
+    kept = [ln for i, ln in enumerate(scan.lines) if i not in used]
+    text = "\n".join(ln.text for ln in kept)
+    # Where each table sat in the prose: the number of kept lines above it.
+    tables = [replace(t, line_index=sum(ln.y1 <= t.bbox[1] + 2 for ln in kept)) for t in tables]
     if len(text) < _MIN_PAGE_CHARS and not tables:
         log.warning("page %d has almost no text; it may be a scanned image that needs OCR", scan.number)
-    return Page(scan.number, scan.label, text, tuple(tables))
+    return Page(scan.number, scan.label, text, tuple(tables), find_headings(kept, body))
 
 
 def parse_pdf(data: bytes) -> list[Page]:
