@@ -350,7 +350,10 @@ def page_label(pdf_label: str, lines: Sequence[Line], page_height: float) -> str
 
 _SECTION_NUMBER = re.compile(r"\d{1,2}(?:\.\d{1,2})*\.?")
 _HEADING_MIN_EXTRA_SIZE = 1.0  # pt above body size
-_HEADING_MAX_CHARS = 120
+# Shared with the chunker's numbered-heading fallback so both agree on what a heading is.
+HEADING_MAX_CHARS = 120
+SENTENCE_ENDINGS = (".", ",", ";", ":")
+_HEADING_MAX_CHARS = HEADING_MAX_CHARS
 
 
 _DOT_LEADER = re.compile(r"(\.\s?){4,}|…{2,}")  # table-of-contents "Summary ....... 14"
@@ -397,7 +400,7 @@ def find_headings(lines: Sequence[Line], body_size: float) -> tuple[Heading, ...
             i += 1
             parts.append(lines[i].text)
         text = _clean(" ".join(parts))
-        if not text.endswith((".", ",", ";")) and not _DOT_LEADER.search(text):
+        if not text.endswith(SENTENCE_ENDINGS) and not _DOT_LEADER.search(text):
             out.append(Heading(start, i + 1, text))
         i += 1
     return tuple(out)

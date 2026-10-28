@@ -17,17 +17,22 @@ from typing import Literal
 
 import tiktoken
 
-from geoagent.ingest.parse import Page, Table
+from geoagent.ingest.parse import HEADING_MAX_CHARS, SENTENCE_ENDINGS, Page, Table
 
 # cl100k is a stand-in for the embedding model's tokenizer; the limit leaves a margin
 # below the embedding input limit (2,048 tokens for gemini-embedding-001).
 _ENCODING = tiktoken.get_encoding("cl100k_base")
 
-# "7.1 Regional Geology", "14 MINERAL RESOURCE ESTIMATES": a 1-2 digit section number,
-# then a capitalised title without digits (excludes "10 Mt at 2.3 g/t", years, and
-# table-of-contents lines ending in page numbers).
-_HEADING = re.compile(r"^\d{1,2}(?:\.\d{1,2})*\s+[A-Z][^\d]*$")
-_HEADING_MAX_CHARS = 100
+# "7.1 Regional Geology", "2.1 Zone 3 Geology": a 1-2 digit section number, then a
+# capitalised title. Titles holding quantities ("10 Mt at 2.3 g/t Au"), ending in a
+# number (table-of-contents "1 SUMMARY .... 15") or in sentence punctuation are not
+# headings; years fail the 1-2 digit number.
+_HEADING = re.compile(r"^\d{1,2}(?:\.\d{1,2})*\s+([A-Z].*)$")
+_QUANTITY = re.compile(r"\d+\.\d+|%")
+_TRAILING_NUMBER = re.compile(r"\d+\s*$")
+# Running headers/footers live in a page's first/last lines *in text order*, which is
+# drawing order, not layout: one report draws 2 header + 3 footer lines at the start.
+_EDGE_LINES = 6
 
 Kind = Literal["text", "table"]
 
@@ -57,31 +62,40 @@ def _word_tokens(word: str) -> int:
 def is_heading(line: str) -> bool:
     """A numbered section heading, not a sentence or a quantity that starts with a number."""
     text = line.strip()
-    return (
-        len(text) <= _HEADING_MAX_CHARS
-        and bool(_HEADING.match(text))
-        and not text.endswith((".", ",", ";", ":"))
-    )
+    match = _HEADING.match(text)
+    if not match or len(text) > HEADING_MAX_CHARS or text.endswith(SENTENCE_ENDINGS):
+        return False
+    title = match.group(1)
+    return not (_QUANTITY.search(title) or _TRAILING_NUMBER.search(title))
 
 
 # --- running headers and footers -----------------------------------------------------
 
 
 def _normalise(line: str) -> str:
-    return re.sub(r"\d", "#", line).strip()
+    """Mask whole digit runs: "Page 5 of 213" and "Page 105 of 213" are the same line."""
+    return re.sub(r"\d+", "#", line).strip()
+
+
+def _edge_indices(lines: Sequence[str]) -> set[int]:
+    """Indices of the first and last few non-blank lines: where headers and footers live."""
+    filled = [i for i, ln in enumerate(lines) if ln.strip()]
+    return set(filled[:_EDGE_LINES] + filled[-_EDGE_LINES:])
 
 
 def _boilerplate(pages: Sequence[Page]) -> set[str]:
-    """Lines (digits masked) repeated on at least half the pages, and on at least 2.
+    """Edge lines (digits masked) repeated on at least half the pages, and on at least 2.
 
-    Counts distinct pages, not occurrences: "DH-001" and "DH-002" both mask to "DH-###"
-    but sit on one page, which makes them content, not a running header.
+    Counts distinct pages, not occurrences: "DH-001" and "DH-002" both mask to "DH-#"
+    but sit on one page, which makes them content, not a running header. Only a page's
+    first/last lines are considered, so a repeated mid-page "Notes:" stays content.
     """
     if len(pages) < 2:
         return set()
     seen: Counter[str] = Counter()
     for page in pages:
-        seen.update({_normalise(ln) for ln in page.text.splitlines() if ln.strip()})
+        lines = page.text.splitlines()
+        seen.update({_normalise(lines[i]) for i in _edge_indices(lines)})
     threshold = max(2, math.ceil(len(pages) / 2))
     return {line for line, count in seen.items() if count >= threshold}
 
@@ -127,18 +141,23 @@ def _stream(pages: Sequence[Page], skip: set[str], numbered_fallback: bool) -> l
         tables = sorted(page.tables, key=lambda t: t.line_index)
         heading_at = {h.start: h for h in page.headings}
         in_heading = {i for h in page.headings for i in range(h.start, h.end)}
+        edges = _edge_indices(lines)
         for i in range(len(lines) + 1):
             items.extend(
                 _TableAt(t, page.number, page.label)
                 for t in tables
                 if min(t.line_index, len(lines)) == i
             )
-            if i == len(lines) or not lines[i].strip() or _normalise(lines[i]) in skip:
+            if i == len(lines):
                 continue
-            if i in heading_at:
+            if i in heading_at:  # headings first: "11" masks like a page-number footer
                 items.append(_HeadingAt(heading_at[i].text))
-            elif i in in_heading:
-                continue  # second line of a heading ("11" + title)
+            elif (
+                i in in_heading  # second line of a heading ("11" + title)
+                or not lines[i].strip()
+                or (i in edges and _normalise(lines[i]) in skip)
+            ):
+                continue
             elif numbered_fallback and is_heading(lines[i]):
                 items.append(_HeadingAt(lines[i].strip()))
             else:
@@ -252,8 +271,8 @@ def chunk_pages(
     strip_headers: bool = True,
 ) -> list[Chunk]:
     """Split parsed pages into retrieval chunks (see module docstring for the rules)."""
-    if overlap_tokens >= max_tokens:
-        raise ValueError("overlap_tokens must be smaller than max_tokens")
+    if max_tokens < 2 or not 0 <= overlap_tokens < max_tokens:
+        raise ValueError("need max_tokens >= 2 and 0 <= overlap_tokens < max_tokens")
     skip = _boilerplate(pages) if strip_headers else set()
 
     drafts: list[_Draft] = []
@@ -265,7 +284,9 @@ def chunk_pages(
         drafts.extend(_Draft("text", section, p) for p in _pack(buffer, max_tokens, overlap_tokens))
         buffer.clear()
 
-    numbered_fallback = not any(p.headings for p in pages)
+    # Typographic headings from the parser win; numbered lines are used as well when the
+    # parser found too few to be the document's real structure (e.g. only a cover title).
+    numbered_fallback = sum(len(p.headings) for p in pages) < max(3, len(pages) // 10)
     for item in _stream(pages, skip, numbered_fallback):
         if isinstance(item, tuple):
             page, label = item

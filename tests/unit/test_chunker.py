@@ -184,9 +184,52 @@ def test_pipes_in_cells_are_escaped():
     assert "| x\\|y | 1 |" in chunk.text
 
 
-def test_invalid_overlap_raises():
+@pytest.mark.parametrize(("max_tokens", "overlap"), [(100, 100), (1, 0), (100, -1)])
+def test_invalid_limits_raise(max_tokens, overlap):
     with pytest.raises(ValueError):
-        chunk_pages([page(1, "x")], max_tokens=100, overlap_tokens=100)
+        chunk_pages([page(1, "x")], max_tokens=max_tokens, overlap_tokens=overlap)
+
+
+# --- review findings ---------------------------------------------------------------
+
+
+def test_footer_with_varying_digit_count_is_boilerplate():
+    # "Page 5 of 120" and "Page 105 of 120" must mask to the same line.
+    pages = [page(n, f"Section body {'x' * n}\nPage {n} of 120") for n in range(1, 121)]
+    assert "Page" not in " ".join(c.text for c in chunk_pages(pages))
+
+
+def test_headings_win_over_boilerplate():
+    # Bare page numbers in the footer mask to "#"; a heading whose first line is "11"
+    # also masks to "#" and must not be erased with them.
+    pages = [page(n, f"Body text {'y' * n}.\n{n}") for n in range(10, 30)]
+    pages[5] = Page(15, None, "11\nSAMPLE PREP\nBody of section.\n15", (), (Heading(0, 2, "11 SAMPLE PREP"),))
+    assert "11 SAMPLE PREP" in {c.section for c in chunk_pages(pages)}
+
+
+def test_a_lone_cover_heading_does_not_disable_numbered_sections():
+    pages = [
+        Page(1, None, "Technical Report", (), (Heading(0, 1, "Technical Report"),)),
+        page(2, "1 SUMMARY\nSummary text."),
+        page(3, "2 INTRODUCTION\nIntro text."),
+    ]
+    sections = [c.section for c in chunk_pages(pages)]
+    assert sections == ["1 SUMMARY", "2 INTRODUCTION"]
+
+
+def test_numbered_heading_may_contain_digits_in_its_title():
+    assert is_heading("2.1 Zone 3 Geology")
+    assert is_heading("7.4 NI 43-101 Compliance")
+    assert not is_heading("Signed by Qualified Persons:")
+
+
+def test_repeated_mid_page_lines_are_content_in_short_documents():
+    # Only the first/last 6 lines of a page can be running headers/footers.
+    def body(tag):
+        return "\n".join([f"{tag}{i}" for i in range(6)] + ["Notes:"] + [f"{tag}z{i}" for i in range(6)])
+
+    pages = [page(1, body("a")), page(2, body("b"))]
+    assert "Notes:" in " ".join(c.text for c in chunk_pages(pages))
 
 
 def test_empty_input():
@@ -206,8 +249,9 @@ def test_sections_come_from_the_parsers_headings():
 def test_numbering_regex_is_only_a_fallback():
     # Once the parser found headings in the document, numbered lines are just text
     # (Waihi: "10 Dilution domains" is a list item, not a section).
+    headings = (Heading(0, 1, "Intro"), Heading(2, 3, "Scope"), Heading(4, 5, "Methods"))
     pages = [
-        Page(1, None, "Intro\nBody.", (), (Heading(0, 1, "Intro"),)),
+        Page(1, None, "Intro\nBody.\nScope\nBody.\nMethods\nBody.", (), headings),
         Page(2, None, "10 Dilution domains\nMore.", ()),
     ]
-    assert {c.section for c in chunk_pages(pages)} == {"Intro"}
+    assert {c.section for c in chunk_pages(pages)} == {"Intro", "Scope", "Methods"}
