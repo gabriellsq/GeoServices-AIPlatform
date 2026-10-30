@@ -66,4 +66,4 @@ def test_concurrent_runners_apply_each_file_once(settings, runner_db):
     for t in threads:
         t.join()
     assert errors == []
-    assert sorted(results, key=len) == [[], [], [], ["001_init.sql"]]
+    assert sorted(results, key=len) == [[], [], [], ["001_init.sql", "002_chunk_kind_labels.sql"]]

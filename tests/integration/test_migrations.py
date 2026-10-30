@@ -21,7 +21,7 @@ def fresh(settings) -> Iterator[psycopg.Connection]:
 
 
 def test_applies_once_and_is_idempotent(fresh):
-    assert apply_migrations(fresh) == ["001_init.sql"]
+    assert apply_migrations(fresh) == ["001_init.sql", "002_chunk_kind_labels.sql"]
     assert apply_migrations(fresh) == []
 
 
