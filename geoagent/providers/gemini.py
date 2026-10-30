@@ -69,16 +69,16 @@ class GeminiEmbeddings:
         return vectors
 
     def _embed_batch(self, batch: list[str], task_type: TaskType) -> list[list[float]]:
-        config = types.EmbedContentConfig(
-            task_type=task_type.value, output_dimensionality=self.dim
-        )
+        config = types.EmbedContentConfig(task_type=task_type.value, output_dimensionality=self.dim)
         for attempt in range(self.max_retries + 1):
             try:
                 result = self.client.models.embed_content(
                     model=self.model, contents=batch, config=config
                 )
             except Exception as exc:
-                transient = isinstance(exc, httpx.TransportError) or _status_code(exc) in RETRYABLE_CODES
+                transient = (
+                    isinstance(exc, httpx.TransportError) or _status_code(exc) in RETRYABLE_CODES
+                )
                 if transient and attempt < self.max_retries:
                     self.sleep(min(2**attempt, 30))
                     continue
@@ -130,6 +130,4 @@ class VertexGeminiProvider:
             if usage
             else 0
         )
-        return Generation(
-            text=text, model=self.model, tokens_in=tokens_in, tokens_out=tokens_out
-        )
+        return Generation(text=text, model=self.model, tokens_in=tokens_in, tokens_out=tokens_out)

@@ -25,7 +25,9 @@ def test_defaults_target_local_development(env):
     assert s.ollama_base_url == "http://127.0.0.1:11434"
     assert s.blob_store == "local"
     assert (s.embedding_model, s.embedding_dim, s.embedding_batch_size) == (
-        "gemini-embedding-001", 768, 32,
+        "gemini-embedding-001",
+        768,
+        32,
     )
     assert s.top_k == 8
     assert (s.db_connect_timeout_s, s.db_connect_retries, s.db_statement_timeout_ms) == (5, 3, 5000)
@@ -98,8 +100,12 @@ def test_empty_values_are_treated_as_missing(env):
 
 @pytest.mark.parametrize(
     ("var", "value"),
-    [("DB_PORT", "99999"), ("DB_CONNECT_TIMEOUT_S", "0"), ("DB_CONNECT_RETRIES", "0"),
-     ("DB_STATEMENT_TIMEOUT_MS", "0")],
+    [
+        ("DB_PORT", "99999"),
+        ("DB_CONNECT_TIMEOUT_S", "0"),
+        ("DB_CONNECT_RETRIES", "0"),
+        ("DB_STATEMENT_TIMEOUT_MS", "0"),
+    ],
 )
 def test_out_of_range_values_are_rejected(env, var, value):
     env.setenv(var, value)

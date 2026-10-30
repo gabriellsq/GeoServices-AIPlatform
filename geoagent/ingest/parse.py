@@ -207,7 +207,8 @@ def reconstruct_table(grid: Grid) -> tuple[tuple[str, ...], tuple[tuple[str, ...
     if width == 0 or not any(cell for row in grid for cell in row):
         return (), ()
     rows = [
-        [GridCell(_clean(c.text), c.x0, c.x1) if c else None for c in row] + [None] * (width - len(row))
+        [GridCell(_clean(c.text), c.x0, c.x1) if c else None for c in row]
+        + [None] * (width - len(row))
         for row in grid  # ragged grids are padded so every row has the same width
     ]
     while rows and not any(_text(c) for c in rows[0]):  # blank space inside the table bbox
@@ -533,7 +534,9 @@ def _build_page(scan: _Scan, body: float) -> Page:
     # Where each table sat in the prose: the number of kept lines above it.
     tables = [replace(t, line_index=sum(ln.y1 <= t.bbox[1] + 2 for ln in kept)) for t in tables]
     if len(text) < _MIN_PAGE_CHARS and not tables:
-        log.warning("page %d has almost no text; it may be a scanned image that needs OCR", scan.number)
+        log.warning(
+            "page %d has almost no text; it may be a scanned image that needs OCR", scan.number
+        )
     return Page(scan.number, scan.label, text, tuple(tables), find_headings(kept, body))
 
 

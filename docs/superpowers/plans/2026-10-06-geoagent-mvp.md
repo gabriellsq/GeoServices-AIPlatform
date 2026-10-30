@@ -1650,9 +1650,7 @@ class GeminiEmbeddings:
         return vectors
 
     def _embed_batch(self, batch: list[str], task_type: TaskType) -> list[list[float]]:
-        config = types.EmbedContentConfig(
-            task_type=task_type.value, output_dimensionality=self.dim
-        )
+        config = types.EmbedContentConfig(task_type=task_type.value, output_dimensionality=self.dim)
         for attempt in range(self.max_retries + 1):
             try:
                 result = self.client.models.embed_content(
@@ -1826,7 +1824,9 @@ def _draw_table(page: pymupdf.Page, x: float, y: float) -> None:
     col_w, row_h = 110.0, 18.0
     for r, row in enumerate(TABLE_ROWS):
         for c, cell in enumerate(row):
-            rect = pymupdf.Rect(x + c * col_w, y + r * row_h, x + (c + 1) * col_w, y + (r + 1) * row_h)
+            rect = pymupdf.Rect(
+                x + c * col_w, y + r * row_h, x + (c + 1) * col_w, y + (r + 1) * row_h
+            )
             page.draw_rect(rect, color=(0, 0, 0), width=0.5)
             page.insert_text((rect.x0 + 3, rect.y1 - 5), cell, fontsize=9)
 
@@ -2176,14 +2176,16 @@ def test_chunks_are_embedded_as_documents(conn, blobs):
 
 
 def test_chunk_rows_carry_workspace_pages_and_section(conn, blobs):
-    r = ingest_bytes(conn, blobs, FakeEmbedder(), workspace_id=WS, data=build_fixture_pdf(), title="t")
+    r = ingest_bytes(
+        conn, blobs, FakeEmbedder(), workspace_id=WS, data=build_fixture_pdf(), title="t"
+    )
     rows = conn.execute(
         "SELECT workspace_id, page_start, page_end, section, token_count FROM chunks "
         "WHERE document_id = %s ORDER BY ordinal",
         (r.document_id,),
     ).fetchall()
     assert all(row[0] == WS for row in rows)
-    assert ("7.1 Regional Geology" in {row[3] for row in rows})
+    assert "7.1 Regional Geology" in {row[3] for row in rows}
     assert all(row[1] <= row[2] and row[4] > 0 for row in rows)
 
 
@@ -2210,8 +2212,12 @@ def test_embedding_failure_marks_document_failed(conn, blobs):
 def test_retry_after_failure_reuses_document_and_succeeds(conn, blobs):
     data = build_fixture_pdf()
     failed = ingest_bytes(
-        conn, blobs, FakeEmbedder(fail_with=ProviderUnavailable("down")),
-        workspace_id=WS, data=data, title="t",
+        conn,
+        blobs,
+        FakeEmbedder(fail_with=ProviderUnavailable("down")),
+        workspace_id=WS,
+        data=data,
+        title="t",
     )
     ok = ingest_bytes(conn, blobs, FakeEmbedder(), workspace_id=WS, data=data, title="t")
     assert ok.status == "ready" and ok.skipped is False
@@ -2228,7 +2234,9 @@ def test_ingest_from_blob_processes_every_pdf_under_prefix(conn, blobs):
     blobs.put(f"incoming/{WS}/alpha.pdf", build_fixture_pdf("a"))
     blobs.put(f"incoming/{WS}/beta.PDF", build_fixture_pdf("b"))
     blobs.put(f"incoming/{WS}/notes.txt", b"ignore me")
-    results = ingest_from_blob(conn, blobs, FakeEmbedder(), workspace_id=WS, prefix=f"incoming/{WS}/")
+    results = ingest_from_blob(
+        conn, blobs, FakeEmbedder(), workspace_id=WS, prefix=f"incoming/{WS}/"
+    )
     assert sorted(r.title for r in results) == ["alpha", "beta"]
     assert all(r.status == "ready" for r in results)
     assert conn.execute("SELECT count(*) FROM documents").fetchone() == (2,)
@@ -2300,15 +2308,29 @@ def seed_chunk(
     conn.execute(
         "INSERT INTO documents (id, workspace_id, title, blob_uri, sha256, status, page_count) "
         "VALUES (%s, %s, %s, %s, %s, 'ready', 1)",
-        (doc_id, workspace_id, document_title, f"local://raw/{doc_id}.pdf",
-         hashlib.sha256(doc_id.bytes).hexdigest()),
+        (
+            doc_id,
+            workspace_id,
+            document_title,
+            f"local://raw/{doc_id}.pdf",
+            hashlib.sha256(doc_id.bytes).hexdigest(),
+        ),
     )
     chunk_id = uuid.uuid4()
     conn.execute(
         "INSERT INTO chunks (id, document_id, workspace_id, ordinal, page_start, page_end, "
         "section, text, token_count, embedding) VALUES (%s, %s, %s, 0, %s, %s, %s, %s, %s, %s)",
-        (chunk_id, doc_id, workspace_id, page, page, section, text, len(text.split()),
-         np.array(vector, dtype=np.float32)),
+        (
+            chunk_id,
+            doc_id,
+            workspace_id,
+            page,
+            page,
+            section,
+            text,
+            len(text.split()),
+            np.array(vector, dtype=np.float32),
+        ),
     )
     return chunk_id
 ```
@@ -2335,10 +2357,18 @@ Q = "where is the gold?"
 @pytest.fixture
 def seeded(conn):
     ids = {
-        "exact": seed_chunk(conn, workspace_id="ws-a", text="exact", vector=basis_vector(0),
-                            document_title="Report A", page=7, section="7.2 Mineralization"),
-        "near": seed_chunk(conn, workspace_id="ws-a", text="near",
-                           vector=normalized([1.0, 1.0] + [0.0] * 766)),
+        "exact": seed_chunk(
+            conn,
+            workspace_id="ws-a",
+            text="exact",
+            vector=basis_vector(0),
+            document_title="Report A",
+            page=7,
+            section="7.2 Mineralization",
+        ),
+        "near": seed_chunk(
+            conn, workspace_id="ws-a", text="near", vector=normalized([1.0, 1.0] + [0.0] * 766)
+        ),
         "far": seed_chunk(conn, workspace_id="ws-a", text="far", vector=basis_vector(1)),
         "other_ws": seed_chunk(conn, workspace_id="ws-b", text="secret", vector=basis_vector(0)),
     }
@@ -2372,7 +2402,10 @@ def test_populates_metadata(conn, seeded):
     assert isinstance(top, RetrievedChunk)
     assert top.chunk_id == seeded["exact"]
     assert (top.document_title, top.page_start, top.page_end, top.section) == (
-        "Report A", 7, 7, "7.2 Mineralization",
+        "Report A",
+        7,
+        7,
+        "7.2 Mineralization",
     )
 
 
@@ -2438,8 +2471,14 @@ from geoagent.rag.retriever import RetrievedChunk
 
 def chunk(title, start, end, section, text) -> RetrievedChunk:
     return RetrievedChunk(
-        chunk_id=uuid.uuid4(), document_id=uuid.uuid4(), document_title=title,
-        page_start=start, page_end=end, section=section, text=text, similarity=0.9,
+        chunk_id=uuid.uuid4(),
+        document_id=uuid.uuid4(),
+        document_title=title,
+        page_start=start,
+        page_end=end,
+        section=section,
+        text=text,
+        similarity=0.9,
     )
 
 
@@ -2463,7 +2502,9 @@ def test_build_prompt_labels_sources():
 
 def test_build_prompt_places_text_after_its_label_and_question_last():
     user = build_prompt("What is the resource?", CHUNKS).user
-    assert user.index("[1] Report A") < user.index("Greywacke basement.") < user.index("[2] Report B")
+    assert (
+        user.index("[1] Report A") < user.index("Greywacke basement.") < user.index("[2] Report B")
+    )
     assert user.rstrip().endswith("What is the resource?")
 
 
@@ -2547,8 +2588,13 @@ from tests.fakes import FakeEmbedder, FakeLLM
 
 def chunk(text: str, similarity: float, title: str = "Report A", page: int = 3) -> RetrievedChunk:
     return RetrievedChunk(
-        chunk_id=uuid.uuid4(), document_id=uuid.uuid4(), document_title=title,
-        page_start=page, page_end=page, section="7.2 Mineralization", text=text,
+        chunk_id=uuid.uuid4(),
+        document_id=uuid.uuid4(),
+        document_title=title,
+        page_start=page,
+        page_end=page,
+        section="7.2 Mineralization",
+        text=text,
         similarity=similarity,
     )
 
@@ -2566,8 +2612,14 @@ def fixed_retrieve(chunks):
 
 def ask(llm, chunks, min_similarity=0.5):
     return answer_question(
-        None, FakeEmbedder(), llm, workspace_id="ws", question="Grade?", top_k=4,
-        min_similarity=min_similarity, retrieve_fn=fixed_retrieve(chunks),
+        None,
+        FakeEmbedder(),
+        llm,
+        workspace_id="ws",
+        question="Grade?",
+        top_k=4,
+        min_similarity=min_similarity,
+        retrieve_fn=fixed_retrieve(chunks),
     )
 
 
@@ -2588,8 +2640,14 @@ def test_answer_with_valid_citations_only():
     assert r.found is True
     assert r.answer == "It is 2.3 g/t [1]. Unrelated claim [7]."
     assert r.citations == [
-        Citation(n=1, document_title="Report A", page_start=3, page_end=3,
-                 section="7.2 Mineralization", snippet=long_text[:200])
+        Citation(
+            n=1,
+            document_title="Report A",
+            page_start=3,
+            page_end=3,
+            section="7.2 Mineralization",
+            snippet=long_text[:200],
+        )
     ]
     assert (r.model, r.tokens_in, r.tokens_out) == ("m1", 10, 5)
 
@@ -2609,8 +2667,16 @@ def test_citation_numbers_follow_kept_order():
 
 def test_passes_arguments_to_retriever():
     retrieve_fn = fixed_retrieve([])
-    answer_question(None, FakeEmbedder(), FakeLLM(), workspace_id="ws-9", question="Q?", top_k=6,
-                    min_similarity=0.5, retrieve_fn=retrieve_fn)
+    answer_question(
+        None,
+        FakeEmbedder(),
+        FakeLLM(),
+        workspace_id="ws-9",
+        question="Q?",
+        top_k=6,
+        min_similarity=0.5,
+        retrieve_fn=retrieve_fn,
+    )
     assert retrieve_fn.calls == [("ws-9", "Q?", 6)]
 
 
@@ -2717,8 +2783,16 @@ def client(tmp_path):
 
 
 def ok_response(**kw) -> AskResponse:
-    base = dict(answer="a [1]", found=True, citations=[], model="m", prompt_version="v1",
-                latency_ms=5, tokens_in=1, tokens_out=1)
+    base = dict(
+        answer="a [1]",
+        found=True,
+        citations=[],
+        model="m",
+        prompt_version="v1",
+        latency_ms=5,
+        tokens_in=1,
+        tokens_out=1,
+    )
     return AskResponse(**{**base, **kw})
 
 
@@ -2812,9 +2886,15 @@ pytestmark = pytest.mark.integration
 
 
 def test_ask_end_to_end_against_postgres(conn):
-    seed_chunk(conn, workspace_id="ws", text="Indicated 1.2 Mt at 2.3 g/t Au.",
-               vector=basis_vector(0), document_title="Kiwi Ridge", page=4,
-               section="14 MINERAL RESOURCE ESTIMATES")
+    seed_chunk(
+        conn,
+        workspace_id="ws",
+        text="Indicated 1.2 Mt at 2.3 g/t Au.",
+        vector=basis_vector(0),
+        document_title="Kiwi Ridge",
+        page=4,
+        section="14 MINERAL RESOURCE ESTIMATES",
+    )
     app = main.create_app()
 
     def use_test_conn():
@@ -2918,7 +2998,9 @@ def get_embedder() -> EmbeddingProvider:
             vertexai=True, project=s.google_cloud_project, location=s.embedding_location
         )
     return GeminiEmbeddings(
-        client=client, model=s.embedding_model, dim=s.embedding_dim,
+        client=client,
+        model=s.embedding_model,
+        dim=s.embedding_dim,
         batch_size=s.embedding_batch_size,
     )
 
@@ -2927,7 +3009,9 @@ def get_embedder() -> EmbeddingProvider:
 def get_llm() -> LLMProvider:
     s = get_settings()
     if s.llm_provider == "ollama":
-        return OllamaProvider(base_url=s.ollama_base_url, model=s.llm_model, timeout_s=s.llm_timeout_s)
+        return OllamaProvider(
+            base_url=s.ollama_base_url, model=s.llm_model, timeout_s=s.llm_timeout_s
+        )
     client = genai.Client(
         vertexai=True,
         project=s.google_cloud_project,
@@ -3094,7 +3178,9 @@ def create_app() -> FastAPI:
         llm: Annotated[LLMProvider, Depends(wiring.get_llm)],
     ):
         result = answer_question(
-            conn, embedder, llm,
+            conn,
+            embedder,
+            llm,
             workspace_id=body.workspace_id,
             question=body.question,
             top_k=body.top_k or settings.top_k,
@@ -3116,16 +3202,16 @@ def create_app() -> FastAPI:
         return dataclasses.asdict(result)
 
     @app.get("/documents", response_model=list[DocumentOut])
-    def list_documents(
-        workspace_id: str, conn: Annotated[psycopg.Connection, Depends(get_conn)]
-    ):
+    def list_documents(workspace_id: str, conn: Annotated[psycopg.Connection, Depends(get_conn)]):
         rows = conn.execute(
             "SELECT id, title, status, page_count, error, created_at FROM documents "
             "WHERE workspace_id = %s ORDER BY created_at",
             (workspace_id,),
         ).fetchall()
         return [
-            DocumentOut(id=r[0], title=r[1], status=r[2], page_count=r[3], error=r[4], created_at=r[5])
+            DocumentOut(
+                id=r[0], title=r[1], status=r[2], page_count=r[3], error=r[4], created_at=r[5]
+            )
             for r in rows
         ]
 
@@ -3194,8 +3280,13 @@ def write(tmp_path, lines):
 
 
 def item(**kw):
-    base = {"id": "q1", "question": "Q?", "expected_answer": "A", "expected_document": "macraes",
-            "category": "exact_term"}
+    base = {
+        "id": "q1",
+        "question": "Q?",
+        "expected_answer": "A",
+        "expected_document": "macraes",
+        "category": "exact_term",
+    }
     return json.dumps({**base, **kw})
 
 
@@ -3316,7 +3407,9 @@ def _report(results: list[IngestResult]) -> None:
 def ingest(
     workspace: Annotated[str, typer.Option(help="Workspace id, e.g. nz-gold")],
     paths: Annotated[list[Path] | None, typer.Argument(help="Local PDF files")] = None,
-    from_blob: Annotated[str | None, typer.Option(help="Blob prefix, e.g. incoming/nz-gold/")] = None,
+    from_blob: Annotated[
+        str | None, typer.Option(help="Blob prefix, e.g. incoming/nz-gold/")
+    ] = None,
 ) -> None:
     """Ingest PDFs from local paths and/or a blob-store prefix."""
     if not paths and not from_blob:
@@ -3326,8 +3419,14 @@ def ingest(
     with wiring.open_connection(statement_timeout_ms=BATCH_STATEMENT_TIMEOUT_MS) as conn:
         for path in paths or []:
             results.append(
-                ingest_bytes(conn, blobs, embedder, workspace_id=workspace,
-                             data=path.read_bytes(), title=path.stem)
+                ingest_bytes(
+                    conn,
+                    blobs,
+                    embedder,
+                    workspace_id=workspace,
+                    data=path.read_bytes(),
+                    title=path.stem,
+                )
             )
         if from_blob:
             results.extend(
@@ -3339,18 +3438,28 @@ def ingest(
 def _ask(conn, workspace: str, question: str, top_k: int | None) -> AskResponse:
     s = get_settings()
     return answer_question(
-        conn, wiring.get_embedder(), wiring.get_llm(), workspace_id=workspace,
-        question=question, top_k=top_k or s.top_k, min_similarity=s.min_similarity,
+        conn,
+        wiring.get_embedder(),
+        wiring.get_llm(),
+        workspace_id=workspace,
+        question=question,
+        top_k=top_k or s.top_k,
+        min_similarity=s.min_similarity,
     )
 
 
 def _print_answer(r: AskResponse) -> None:
     typer.echo(r.answer)
     for c in r.citations:
-        pages = f"p. {c.page_start}" if c.page_start == c.page_end else f"pp. {c.page_start}-{c.page_end}"
+        pages = (
+            f"p. {c.page_start}"
+            if c.page_start == c.page_end
+            else f"pp. {c.page_start}-{c.page_end}"
+        )
         typer.echo(f"  [{c.n}] {c.document_title} | {pages} | {c.section or '-'}")
-    typer.echo(f"  ({r.model}, {r.prompt_version}, {r.latency_ms} ms, "
-               f"{r.tokens_in}+{r.tokens_out} tokens)")
+    typer.echo(
+        f"  ({r.model}, {r.prompt_version}, {r.latency_ms} ms, {r.tokens_in}+{r.tokens_out} tokens)"
+    )
 
 
 @app.command()
@@ -3688,10 +3797,12 @@ TEXTS = [
 def main() -> None:
     project = sys.argv[1]
     location = sys.argv[2] if len(sys.argv) > 2 else "us-central1"
-    studio = GeminiEmbeddings(genai.Client(api_key=os.environ["GEMINI_API_KEY"]),
-                              "gemini-embedding-001", 768)
-    vertex = GeminiEmbeddings(genai.Client(vertexai=True, project=project, location=location),
-                              "gemini-embedding-001", 768)
+    studio = GeminiEmbeddings(
+        genai.Client(api_key=os.environ["GEMINI_API_KEY"]), "gemini-embedding-001", 768
+    )
+    vertex = GeminiEmbeddings(
+        genai.Client(vertexai=True, project=project, location=location), "gemini-embedding-001", 768
+    )
     a = studio.embed(TEXTS, TaskType.RETRIEVAL_DOCUMENT)
     b = vertex.embed(TEXTS, TaskType.RETRIEVAL_DOCUMENT)
     for text, va, vb in zip(TEXTS, a, b):

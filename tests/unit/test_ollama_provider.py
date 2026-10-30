@@ -108,7 +108,9 @@ def test_sends_num_ctx_and_split_timeouts():
         return httpx.Response(200, json=ok_body())
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    OllamaProvider(base_url="http://h:11434", model="m", timeout_s=60, client=client).generate("s", "p")
+    OllamaProvider(base_url="http://h:11434", model="m", timeout_s=60, client=client).generate(
+        "s", "p"
+    )
     assert seen["body"]["options"] == {"temperature": 0, "num_ctx": 8192}
     assert seen["timeout"]["connect"] == 5.0
     assert seen["timeout"]["read"] == 60
@@ -156,7 +158,9 @@ def test_long_error_bodies_are_truncated():
 
 
 def test_close_only_closes_owned_client():
-    injected = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=ok_body())))
+    injected = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=ok_body()))
+    )
     OllamaProvider(base_url="http://h", model="m", client=injected).close()
     assert not injected.is_closed
     owned = OllamaProvider(base_url="http://h", model="m")

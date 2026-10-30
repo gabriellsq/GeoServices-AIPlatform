@@ -167,7 +167,9 @@ def test_vertex_satisfies_protocol():
 
 def test_vertex_no_candidates_is_an_error():
     with pytest.raises(ProviderError, match="no candidates"):
-        vertex(FakeModels([gen_response(text=None, has_candidates=False, block="SAFETY")])).generate("s", "p")
+        vertex(
+            FakeModels([gen_response(text=None, has_candidates=False, block="SAFETY")])
+        ).generate("s", "p")
 
 
 @pytest.mark.parametrize("finish", ["SAFETY", "MAX_TOKENS", "RECITATION"])
@@ -183,7 +185,9 @@ def test_vertex_empty_answer_is_an_error():
 
 def test_missing_embeddings_is_a_provider_error():
     with pytest.raises(ProviderError):
-        embedder(FakeModels([SimpleNamespace(embeddings=None)])).embed(["x"], TaskType.RETRIEVAL_DOCUMENT)
+        embedder(FakeModels([SimpleNamespace(embeddings=None)])).embed(
+            ["x"], TaskType.RETRIEVAL_DOCUMENT
+        )
 
 
 def test_transient_transport_error_is_retried():

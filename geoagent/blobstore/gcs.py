@@ -22,7 +22,9 @@ class GcsBlobStore:
 
     def list_keys(self, prefix: str) -> list[str]:
         # Objects ending in "/" are console "folder" placeholders, not data.
-        return sorted(b.name for b in self._bucket.list_blobs(prefix=prefix) if not b.name.endswith("/"))
+        return sorted(
+            b.name for b in self._bucket.list_blobs(prefix=prefix) if not b.name.endswith("/")
+        )
 
     def uri_for(self, key: str) -> str:
         return f"gs://{self.bucket_name}/{validate_key(key)}"

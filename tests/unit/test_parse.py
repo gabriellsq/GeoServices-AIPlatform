@@ -91,14 +91,43 @@ def test_reconstruct_multi_level_header():
     raw = grid(
         [("Gold", 0, 50), ("Measured", 50, 80), None, None, ("Indicated", 80, 110), None, None],
         [None, ("", 50, 80), None, None, ("", 80, 110), None, None],
-        [None, ("Tonnes", 50, 60), ("Au", 60, 70), ("Contained", 70, 80),
-         ("Tonnes", 80, 90), ("Au", 90, 100), ("Contained", 100, 110)],
-        [None, ("(Mt)", 50, 60), ("(g/t)", 60, 70), ("Ozs (Moz)", 70, 80),
-         ("(Mt)", 80, 90), ("(g/t)", 90, 100), ("Ozs (Moz)", 100, 110)],
+        [
+            None,
+            ("Tonnes", 50, 60),
+            ("Au", 60, 70),
+            ("Contained", 70, 80),
+            ("Tonnes", 80, 90),
+            ("Au", 90, 100),
+            ("Contained", 100, 110),
+        ],
+        [
+            None,
+            ("(Mt)", 50, 60),
+            ("(g/t)", 60, 70),
+            ("Ozs (Moz)", 70, 80),
+            ("(Mt)", 80, 90),
+            ("(g/t)", 90, 100),
+            ("Ozs (Moz)", 100, 110),
+        ],
         [("Macraes", 0, 50), None, None, None, None, None, None],
-        [("Coronation\nNorth", 0, 50), ("0.14", 50, 60), ("1.23", 60, 70), ("0.01", 70, 80),
-         ("3.06", 80, 90), ("0.63", 90, 100), ("0.06", 100, 110)],
-        [("", 0, 50), ("", 50, 60), ("", 60, 70), ("", 70, 80), ("", 80, 90), ("", 90, 100), ("", 100, 110)],
+        [
+            ("Coronation\nNorth", 0, 50),
+            ("0.14", 50, 60),
+            ("1.23", 60, 70),
+            ("0.01", 70, 80),
+            ("3.06", 80, 90),
+            ("0.63", 90, 100),
+            ("0.06", 100, 110),
+        ],
+        [
+            ("", 0, 50),
+            ("", 50, 60),
+            ("", 60, 70),
+            ("", 70, 80),
+            ("", 80, 90),
+            ("", 90, 100),
+            ("", 100, 110),
+        ],
     )
     header, rows = reconstruct_table(raw)
     assert header == (
@@ -125,19 +154,40 @@ def test_reconstruct_uses_geometry_not_grid_position():
         return [(label, 0, 60), None, (t, 66, 100), (au, 100, 130), None, (inf, 136, 170), None]
 
     raw = grid(
-        [("Area", 0, 60), None, ("Indicated", 72, 130), None, ("", 130, 136), ("Inferred", 136, 176), None],
+        [
+            ("Area", 0, 60),
+            None,
+            ("Indicated", 72, 130),
+            None,
+            ("", 130, 136),
+            ("Inferred", 136, 176),
+            None,
+        ],
         [None, None, ("Tonnes", 66, 100), ("Au", 100, 130), None, ("Tonnes", 136, 170), None],
         [None, None, ("(Mt)", 66, 100), ("(Moz)", 100, 130), None, ("(Mt)", 136, 170), None],
         data("MOP", "6.50", "0.41", "2.3"),
         data("GOP", "3.22", "0.15", "0.8"),
         data("MUG", "6.42", "1.09", "2.7"),
         data("WUG", "2.39", "1.37", "1.3"),
-        [("", 0, 60), ("Total", 60, 66), ("18.5", 66, 100), ("3.02", 100, 130), None, ("7.1", 136, 170), None],
+        [
+            ("", 0, 60),
+            ("Total", 60, 66),
+            ("18.5", 66, 100),
+            ("3.02", 100, 130),
+            None,
+            ("7.1", 136, 170),
+            None,
+        ],
         [None, ("Mineral", 60, 66), None, None, None, None, None],
         [None, ("Resources", 60, 66), None, None, None, None, None],
     )
     header, rows = reconstruct_table(raw)
-    assert header == ("Area", "Indicated · Tonnes (Mt)", "Indicated · Au (Moz)", "Inferred · Tonnes (Mt)")
+    assert header == (
+        "Area",
+        "Indicated · Tonnes (Mt)",
+        "Indicated · Au (Moz)",
+        "Inferred · Tonnes (Mt)",
+    )
     assert rows == (
         ("MOP", "6.50", "0.41", "2.3"),
         ("GOP", "3.22", "0.15", "0.8"),
@@ -145,7 +195,6 @@ def test_reconstruct_uses_geometry_not_grid_position():
         ("WUG", "2.39", "1.37", "1.3"),
         ("Total Mineral Resources", "18.5", "3.02", "7.1"),
     )
-
 
 
 def test_reconstruct_text_table_with_wrapped_cells():
@@ -167,6 +216,7 @@ def test_reconstruct_text_table_with_wrapped_cells():
         ("Notes", "Embankment to design, ongoing deposition"),
         ("Impact", "High"),
     )
+
 
 # --- caption / notes / label detectors (pure functions over positioned lines) ---------
 
@@ -190,7 +240,9 @@ def test_caption_is_the_table_line_just_above_including_its_wrapped_lines():
 
 
 def test_no_caption_when_no_table_line_or_too_far_above():
-    assert find_caption([line("Significant intercepts are listed below.", 180, 192)], TABLE_BBOX) == (None, set())
+    assert find_caption(
+        [line("Significant intercepts are listed below.", 180, 192)], TABLE_BBOX
+    ) == (None, set())
     assert find_caption([line("Table 1-1 Too far away", 100, 112)], TABLE_BBOX) == (None, set())
 
 
@@ -201,20 +253,32 @@ def test_notes_are_contiguous_smaller_font_lines_below():
         line("1.10 Mineral Reserve Estimate", 335, 347, size=12),  # heading: bigger font, stop
         line("Released: March 27, 2026   Page 21 of 213", 780, 790, size=8),
     ]
-    assert find_notes(lines, TABLE_BBOX, body_size=10) == ("Notes:\n- All figures are rounded.", {0, 1})
+    assert find_notes(lines, TABLE_BBOX, body_size=10) == (
+        "Notes:\n- All figures are rounded.",
+        {0, 1},
+    )
 
 
 def test_notes_stop_at_a_vertical_gap():
-    lines = [line("Note: uncut grades.", 305, 314, size=8), line("small footer text", 360, 370, size=8)]
+    lines = [
+        line("Note: uncut grades.", 305, 314, size=8),
+        line("small footer text", 360, 370, size=8),
+    ]
     assert find_notes(lines, TABLE_BBOX, body_size=10) == ("Note: uncut grades.", {0})
 
 
 def test_no_notes_when_body_text_follows_the_table():
-    assert find_notes([line("The table shows...", 305, 317, size=10)], TABLE_BBOX, body_size=10) == (None, set())
+    assert find_notes(
+        [line("The table shows...", 305, 317, size=10)], TABLE_BBOX, body_size=10
+    ) == (None, set())
 
 
 def test_body_font_size_is_the_most_common_size_by_characters():
-    lines = [line("x" * 200, 0, 10, size=11), line("Heading", 20, 30, size=14), line("y" * 50, 40, 50, size=9)]
+    lines = [
+        line("x" * 200, 0, 10, size=11),
+        line("Heading", 20, 30, size=14),
+        line("y" * 50, 40, 50, size=9),
+    ]
     assert body_font_size(lines) == 11
 
 
@@ -277,7 +341,9 @@ def png_bytes() -> bytes:
 
 
 @pytest.mark.parametrize(
-    "make", [lambda: b"<html>x</html>", png_bytes, lambda: ZERO_PAGE_PDF], ids=["html", "png", "zero-pages"]
+    "make",
+    [lambda: b"<html>x</html>", png_bytes, lambda: ZERO_PAGE_PDF],
+    ids=["html", "png", "zero-pages"],
 )
 def test_non_pdf_and_empty_documents_raise_value_error(make):
     with pytest.raises(ValueError):
@@ -375,7 +441,9 @@ def test_bordered_text_box_stays_in_prose():
     doc = pymupdf.open()
     page = doc.new_page()
     page.draw_rect(pymupdf.Rect(50, 100, 500, 160), color=(0, 0, 0), width=0.5)
-    page.insert_text((60, 130), "A paragraph drawn inside a bordered box, not a table.", fontsize=10)
+    page.insert_text(
+        (60, 130), "A paragraph drawn inside a bordered box, not a table.", fontsize=10
+    )
     (parsed,) = parse_pdf(doc.tobytes())
     assert parsed.tables == ()
     assert "inside a bordered box" in parsed.text
@@ -405,7 +473,10 @@ def test_footer_is_not_notes():
 
 
 def test_notes_stop_at_the_next_tables_caption():
-    lines = [line("Source: first survey", 305, 314, size=8), line("Table 2: Second table", 318, 327, size=8)]
+    lines = [
+        line("Source: first survey", 305, 314, size=8),
+        line("Table 2: Second table", 318, 327, size=8),
+    ]
     assert find_notes(lines, TABLE_BBOX, body_size=10) == ("Source: first survey", {0})
 
 
@@ -474,7 +545,9 @@ def styled(text, y0, size, bold=False):
 def test_headings_are_lines_larger_than_body_text():
     lines = [
         styled("11", 100, 14, bold=True),  # Waihi: the section number on its own line...
-        styled("SAMPLE PREPARATION, ANALYSES, AND SECURITY", 100, 14, bold=True),  # ...then the title
+        styled(
+            "SAMPLE PREPARATION, ANALYSES, AND SECURITY", 100, 14, bold=True
+        ),  # ...then the title
         styled("Samples were collected from drill core.", 130, 10),
         styled("Sampling Methods and Preparation", 160, 12, bold=True),  # unnumbered subsection
         styled("1.10 Mineral Reserve Estimate", 200, 12),  # Macraes: larger, not bold
@@ -488,12 +561,20 @@ def test_headings_are_lines_larger_than_body_text():
 
 
 def test_wrapped_heading_lines_are_merged():
-    lines = [styled("MINERAL RESOURCE", 100, 14), styled("ESTIMATES", 116, 14), styled("Body.", 150, 10)]
+    lines = [
+        styled("MINERAL RESOURCE", 100, 14),
+        styled("ESTIMATES", 116, 14),
+        styled("Body.", 150, 10),
+    ]
     assert find_headings(lines, body_size=10) == (Heading(0, 2, "MINERAL RESOURCE ESTIMATES"),)
 
 
 def test_large_sentences_and_lone_numbers_are_not_headings():
-    lines = [styled("This is an emphasised sentence.", 100, 14), styled("7", 140, 14), styled("Body.", 170, 10)]
+    lines = [
+        styled("This is an emphasised sentence.", 100, 14),
+        styled("7", 140, 14),
+        styled("Body.", 170, 10),
+    ]
     assert find_headings(lines, body_size=10) == ()
 
 

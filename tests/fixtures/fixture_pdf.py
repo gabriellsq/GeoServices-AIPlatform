@@ -51,7 +51,9 @@ def _draw_table(page: pymupdf.Page, x: float, y: float) -> float:
     col_w, row_h = 110.0, 18.0
     for r, row in enumerate(TABLE_ROWS):
         for c, cell in enumerate(row):
-            rect = pymupdf.Rect(x + c * col_w, y + r * row_h, x + (c + 1) * col_w, y + (r + 1) * row_h)
+            rect = pymupdf.Rect(
+                x + c * col_w, y + r * row_h, x + (c + 1) * col_w, y + (r + 1) * row_h
+            )
             page.draw_rect(rect, color=(0, 0, 0), width=0.5)
             page.insert_text((rect.x0 + 3, rect.y1 - 5), cell, fontsize=9)
     return y + len(TABLE_ROWS) * row_h
@@ -73,6 +75,8 @@ def build_fixture_pdf(variant: str = "a") -> bytes:
             bottom = _draw_table(page, 50, y + 20)
             page.insert_text((50, bottom + 14), TABLE_NOTES, fontsize=8)
         page.insert_text((260, 815), f"Page {number} of {len(pages)}", fontsize=9)
-    data = doc.tobytes(no_new_id=True)  # no random trailer /ID: same input -> same bytes -> same sha256
+    data = doc.tobytes(
+        no_new_id=True
+    )  # no random trailer /ID: same input -> same bytes -> same sha256
     doc.close()
     return data

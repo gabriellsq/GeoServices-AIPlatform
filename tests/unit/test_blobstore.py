@@ -29,12 +29,16 @@ class FakeBucket:
         return FakeBlob(self, name)
 
     def list_blobs(self, prefix):
-        return [SimpleNamespace(name=n) for n in reversed(list(self.objects)) if n.startswith(prefix)]
+        return [
+            SimpleNamespace(name=n) for n in reversed(list(self.objects)) if n.startswith(prefix)
+        ]
 
 
 def make_gcs():
     bucket = FakeBucket()
-    return GcsBlobStore(client=SimpleNamespace(bucket=lambda name: bucket), bucket="my-bucket"), bucket
+    return GcsBlobStore(
+        client=SimpleNamespace(bucket=lambda name: bucket), bucket="my-bucket"
+    ), bucket
 
 
 @pytest.fixture(params=["local", "gcs"])
@@ -65,8 +69,19 @@ def test_missing_key_raises_blob_not_found(store):
 
 
 INVALID_KEYS = [
-    "", ".", "a/..", "../escape.pdf", "a/../../x", "/etc/x", "a\\b.pdf", "C:\\x",
-    "a//b.pdf", "a/./b.pdf", "trailing/", "x.pdf:stream", "nul\x00byte",
+    "",
+    ".",
+    "a/..",
+    "../escape.pdf",
+    "a/../../x",
+    "/etc/x",
+    "a\\b.pdf",
+    "C:\\x",
+    "a//b.pdf",
+    "a/./b.pdf",
+    "trailing/",
+    "x.pdf:stream",
+    "nul\x00byte",
 ]
 
 
@@ -85,7 +100,9 @@ def test_stores_satisfy_protocol(store):
 
 
 def test_uris(tmp_path):
-    assert LocalFsBlobStore(tmp_path, "raw").uri_for("raw/ws/doc.pdf") == "local://raw/raw/ws/doc.pdf"
+    assert (
+        LocalFsBlobStore(tmp_path, "raw").uri_for("raw/ws/doc.pdf") == "local://raw/raw/ws/doc.pdf"
+    )
     assert make_gcs()[0].uri_for("raw/ws/x.pdf") == "gs://my-bucket/raw/ws/x.pdf"
 
 

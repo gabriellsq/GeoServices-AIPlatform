@@ -38,7 +38,12 @@ def test_count_tokens_is_positive_and_monotonic():
 
 @pytest.mark.parametrize(
     "line",
-    ["1 SUMMARY", "7.1 Regional Geology", "1.10 Mineral Reserve Estimate", "14 MINERAL RESOURCE ESTIMATES"],
+    [
+        "1 SUMMARY",
+        "7.1 Regional Geology",
+        "1.10 Mineral Reserve Estimate",
+        "14 MINERAL RESOURCE ESTIMATES",
+    ],
 )
 def test_numbered_headings_are_detected(line):
     assert is_heading(line)
@@ -139,7 +144,10 @@ def test_long_section_split_with_overlap():
 
 def test_text_before_first_heading_has_no_section():
     chunks = chunk_pages([page(1, "Preface text.\n1 SUMMARY\nBody text.")])
-    assert [(c.section, c.text) for c in chunks] == [(None, "Preface text."), ("1 SUMMARY", "Body text.")]
+    assert [(c.section, c.text) for c in chunks] == [
+        (None, "Preface text."),
+        ("1 SUMMARY", "Body text."),
+    ]
 
 
 def test_boilerplate_counts_distinct_pages_not_occurrences():
@@ -203,7 +211,9 @@ def test_headings_win_over_boilerplate():
     # Bare page numbers in the footer mask to "#"; a heading whose first line is "11"
     # also masks to "#" and must not be erased with them.
     pages = [page(n, f"Body text {'y' * n}.\n{n}") for n in range(10, 30)]
-    pages[5] = Page(15, None, "11\nSAMPLE PREP\nBody of section.\n15", (), (Heading(0, 2, "11 SAMPLE PREP"),))
+    pages[5] = Page(
+        15, None, "11\nSAMPLE PREP\nBody of section.\n15", (), (Heading(0, 2, "11 SAMPLE PREP"),)
+    )
     assert "11 SAMPLE PREP" in {c.section for c in chunk_pages(pages)}
 
 
@@ -226,7 +236,9 @@ def test_numbered_heading_may_contain_digits_in_its_title():
 def test_repeated_mid_page_lines_are_content_in_short_documents():
     # Only the first/last 6 lines of a page can be running headers/footers.
     def body(tag):
-        return "\n".join([f"{tag}{i}" for i in range(6)] + ["Notes:"] + [f"{tag}z{i}" for i in range(6)])
+        return "\n".join(
+            [f"{tag}{i}" for i in range(6)] + ["Notes:"] + [f"{tag}z{i}" for i in range(6)]
+        )
 
     pages = [page(1, body("a")), page(2, body("b"))]
     assert "Notes:" in " ".join(c.text for c in chunk_pages(pages))

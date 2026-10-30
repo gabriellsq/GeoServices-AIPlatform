@@ -190,7 +190,9 @@ def _split_long_word(word: _Word, limit: int) -> list[_Word]:
     if len(ids) <= limit:
         return [word]
     return [
-        _Word(_ENCODING.decode(ids[i : i + limit]), word.starts_line and i == 0, word.page, word.label)
+        _Word(
+            _ENCODING.decode(ids[i : i + limit]), word.starts_line and i == 0, word.page, word.label
+        )
         for i in range(0, len(ids), limit)
     ]
 
